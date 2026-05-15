@@ -1,0 +1,7 @@
+performance:
+  target_fps: 30
+  log_interval_seconds: 5
+  max_frame_latency_ms: 80
+  enable_frame_skip: true
+  resize_width: 640
+

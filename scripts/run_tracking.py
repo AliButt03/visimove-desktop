@@ -1,0 +1,528 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from visimove.calibration import CalibrationProfile, load_calibration_profile
+from visimove.config import load_config
+from visimove.gaze.eyetrax_adapter import EyeTraxAdapter, EyeTraxSetupStatus
+from visimove.gaze.gazefollower_adapter import GazeFollowerAdapter, GazeFollowerSetupStatus
+from visimove.pipeline.realtime_pipeline import build_realtime_pipeline
+from visimove.utils.screen import ScreenBounds, get_screen_bounds
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the first VisiMove webcam pipeline.")
+    parser.add_argument("--config", default="config/default.yaml")
+    parser.add_argument("--camera-index", type=int, default=None)
+    parser.add_argument("--enable-cursor", action="store_true", help="Enable real cursor movement.")
+    parser.add_argument("--gaze-backend", choices=("dummy", "eyetrax", "gazefollower", "mobilegaze"))
+    parser.add_argument("--detector-backend", choices=("dummy", "opencv", "mediapipe", "yolo"))
+    parser.add_argument("--blink-backend", choices=("dummy", "ocec", "onnx"))
+    parser.add_argument("--calibration-profile", help="Path to a saved calibration profile JSON file.")
+    parser.add_argument(
+        "--allow-dummy-cursor",
+        action="store_true",
+        help="Allow dummy gaze to move the real cursor. Use only for pipeline testing.",
+    )
+    parser.add_argument(
+        "--allow-low-quality-calibration",
+        action="store_true",
+        help="Allow cursor movement with poor/needs_review calibration quality. Use only for careful testing.",
+    )
+    parser.add_argument(
+        "--allow-unstable-live-gaze",
+        action="store_true",
+        help="Allow cursor movement while live gaze is outside calibration domain. Use only for careful testing.",
+    )
+    parser.add_argument("--show-debug", action="store_true", help="Print startup/debug tracking details.")
+    parser.add_argument("--no-preview", action="store_true", help="Run without OpenCV preview window.")
+    parser.add_argument("--horizontal-gain", type=float, help="Expand or reduce mapped X around screen center.")
+    parser.add_argument("--vertical-gain", type=float, help="Expand or reduce mapped Y around screen center.")
+    parser.add_argument("--horizontal-offset", type=float, help="Shift mapped X after calibration, in pixels.")
+    parser.add_argument("--vertical-offset", type=float, help="Shift mapped Y after calibration, in pixels.")
+    args = parser.parse_args()
+
+    config = load_config(args.config, "config/performance.yaml")
+    apply_cli_overrides(config, args)
+
+    startup = build_startup_summary(config, args)
+    apply_external_fallback_cursor_gate(config, startup, args)
+    apply_calibration_cursor_gate(config, startup, args)
+    apply_calibration_runtime_metadata(config, startup)
+    startup = build_startup_summary(config, args)
+    print_startup_summary(startup)
+    print_gaze_backend_warnings(startup, args)
+    print_calibration_warnings(startup)
+    print_axis_tuning_warnings(config)
+
+    if startup["dummy_cursor_blocked"]:
+        print(
+            "Dummy gaze backend is active. Cursor movement is disabled because dummy gaze does not "
+            "represent real eye gaze. Use --allow-dummy-cursor only for pipeline testing."
+        )
+    elif not args.enable_cursor:
+        print("Cursor movement is disabled. Pass --enable-cursor only after calibration is safe.")
+    elif not args.allow_unstable_live_gaze and config.get("calibration", {}).get(
+        "block_cursor_when_outside_calibration_domain",
+        True,
+    ):
+        print(
+            "Live gaze safety is active. Cursor movement will be blocked if live gaze leaves "
+            "the calibrated gaze domain."
+        )
+    elif config.get("cursor", {}).get("start_paused", True):
+        print("Cursor movement is enabled but starts paused for safety. Press 'p' in the preview to resume/pause.")
+
+    warn_if_calibration_profile_is_degenerate(Path(startup["calibration_profile_path"]))
+
+    try:
+        build_realtime_pipeline(config).run()
+    except KeyboardInterrupt:
+        print("Stopped by user.")
+    except RuntimeError as exc:
+        print(f"VisiMove error: {exc}")
+        raise SystemExit(1) from exc
+
+
+def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
+    camera_config = config.setdefault("camera", {})
+    detection_config = config.setdefault("detection", {})
+    gaze_config = config.setdefault("gaze", {})
+    blink_config = config.setdefault("blink", {})
+    calibration_config = config.setdefault("calibration", {})
+    cursor_config = config.setdefault("cursor", {})
+    pipeline_config = config.setdefault("pipeline", {})
+
+    if args.camera_index is not None:
+        camera_config["index"] = args.camera_index
+    if args.detector_backend is not None:
+        detection_config["detector_backend"] = args.detector_backend
+        detection_config["backend"] = args.detector_backend
+    if args.gaze_backend is not None:
+        gaze_config["gaze_backend"] = args.gaze_backend
+        gaze_config["backend"] = args.gaze_backend
+    if args.blink_backend is not None:
+        blink_config["backend"] = args.blink_backend
+    if args.calibration_profile is not None:
+        calibration_config["profile_path"] = args.calibration_profile
+    elif not calibration_config.get("profile_path"):
+        fallback_profile = PROJECT_ROOT / "data" / "calibration" / "user_profile.json"
+        if fallback_profile.exists():
+            calibration_config["profile_path"] = str(fallback_profile)
+
+    gaze_backend = get_gaze_backend(config)
+    if args.calibration_profile is None and gaze_backend == "eyetrax":
+        default_profile = PROJECT_ROOT / "data" / "calibration" / "user_profile.json"
+        eyetrax_profile = PROJECT_ROOT / "data" / "calibration" / "user_profile_eyetrax.json"
+        configured = resolve_project_path(calibration_config.get("profile_path", default_profile))
+        if configured == default_profile and eyetrax_profile.exists():
+            calibration_config["profile_path"] = str(eyetrax_profile)
+
+    if calibration_config.get("profile_path"):
+        calibration_config["profile_path"] = str(resolve_project_path(calibration_config["profile_path"]))
+
+    requested_cursor = bool(args.enable_cursor)
+    dummy_cursor_blocked = requested_cursor and gaze_backend == "dummy" and not bool(args.allow_dummy_cursor)
+
+    cursor_config["enabled"] = requested_cursor and not dummy_cursor_blocked
+    cursor_config["allow_dummy_cursor"] = bool(args.allow_dummy_cursor)
+    pipeline_config["show_preview"] = not args.no_preview
+    pipeline_config["show_debug"] = bool(args.show_debug)
+    pipeline_config["dry_run"] = not bool(cursor_config["enabled"])
+    pipeline_config["allow_unstable_live_gaze"] = bool(args.allow_unstable_live_gaze)
+
+    if args.horizontal_gain is not None:
+        calibration_config["horizontal_gain"] = args.horizontal_gain
+    if args.vertical_gain is not None:
+        calibration_config["vertical_gain"] = args.vertical_gain
+    if args.horizontal_offset is not None:
+        calibration_config["horizontal_offset"] = args.horizontal_offset
+    if args.vertical_offset is not None:
+        calibration_config["vertical_offset"] = args.vertical_offset
+
+
+def get_gaze_backend(config: dict[str, Any]) -> str:
+    gaze_config = config.get("gaze", {})
+    return str(gaze_config.get("gaze_backend", gaze_config.get("backend", "dummy"))).lower()
+
+
+def get_detector_backend(config: dict[str, Any]) -> str:
+    detection_config = config.get("detection", {})
+    return str(detection_config.get("detector_backend", detection_config.get("backend", "auto"))).lower()
+
+
+def build_startup_summary(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    camera_config = config.get("camera", {})
+    performance_config = config.get("performance", {})
+    current_screen = get_screen_bounds()
+    calibration_profile = resolve_calibration_path(config)
+    loaded_profile, load_error = load_profile_if_available(calibration_profile)
+    eyetrax_status = get_eyetrax_setup_status(config)
+    gazefollower_status = get_gazefollower_setup_status(config)
+
+    requested_cursor = bool(args.enable_cursor)
+    gaze_backend = get_gaze_backend(config)
+    dummy_cursor_blocked = requested_cursor and gaze_backend == "dummy" and not bool(args.allow_dummy_cursor)
+    effective_backend = gaze_backend
+    if gaze_backend == "eyetrax" and not eyetrax_status.ready:
+        effective_backend = "dummy"
+    if gaze_backend == "gazefollower" and not gazefollower_status.ready:
+        effective_backend = "dummy"
+    mismatch_reasons = calibration_mismatch_reasons(
+        loaded_profile,
+        current_gaze_backend=gaze_backend,
+        current_detector_backend=get_detector_backend(config),
+        current_screen=current_screen,
+    )
+
+    resize_width = performance_config.get("resize_width")
+    frame_size = f"{camera_config.get('width', 'auto')}x{camera_config.get('height', 'auto')}"
+    if resize_width:
+        frame_size = f"{frame_size} (resized width {resize_width})"
+
+    return {
+        "detector_backend": get_detector_backend(config),
+        "gaze_backend": gaze_backend,
+        "effective_gaze_backend": effective_backend,
+        "blink_backend": str(config.get("blink", {}).get("backend", "dummy")).lower(),
+        "gaze_fallback_to_dummy": bool(config.get("gaze", {}).get("fallback_to_dummy", True)),
+        "eyetrax_ready": eyetrax_status.ready,
+        "eyetrax_reason": eyetrax_status.reason,
+        "eyetrax_model_path": str(eyetrax_status.model_path) if eyetrax_status.model_path else "none",
+        "eyetrax_face_model_path": (
+            str(eyetrax_status.face_landmarker_model_path)
+            if eyetrax_status.face_landmarker_model_path
+            else "none"
+        ),
+        "gazefollower_ready": gazefollower_status.ready,
+        "gazefollower_reason": gazefollower_status.reason,
+        "gazefollower_model_path": (
+            str(gazefollower_status.model_path) if gazefollower_status.model_path else "none"
+        ),
+        "gazefollower_face_model_path": (
+            str(gazefollower_status.face_model_path) if gazefollower_status.face_model_path else "none"
+        ),
+        "gazefollower_missing_dependencies": gazefollower_status.missing_dependencies,
+        "calibration_profile_path": str(calibration_profile) if calibration_profile else "none",
+        "calibration_loaded": loaded_profile is not None,
+        "calibration_load_error": load_error,
+        "calibration_model_type": loaded_profile.mapping_model_type if loaded_profile else "none",
+        "calibration_gaze_backend": loaded_profile.gaze_backend if loaded_profile else "none",
+        "calibration_detector_backend": loaded_profile.detector_backend if loaded_profile else "none",
+        "calibration_screen_width": loaded_profile.screen_width if loaded_profile else "none",
+        "calibration_screen_height": loaded_profile.screen_height if loaded_profile else "none",
+        "calibration_timestamp": loaded_profile.timestamp if loaded_profile else "none",
+        "calibration_quality": loaded_profile.calibration_quality if loaded_profile else "none",
+        "calibration_warnings": loaded_profile.calibration_warnings if loaded_profile else [],
+        "calibration_raw_domain": calibration_raw_domain(loaded_profile),
+        "current_screen_width": current_screen.width,
+        "current_screen_height": current_screen.height,
+        "calibration_mismatch_reasons": mismatch_reasons,
+        "cursor_enabled": bool(config.get("cursor", {}).get("enabled", False)),
+        "dummy_cursor_allowed": bool(args.allow_dummy_cursor),
+        "dummy_cursor_blocked": dummy_cursor_blocked,
+        "camera_index": camera_config.get("index", 0),
+        "frame_size": frame_size,
+        "smoothing_method": str(config.get("smoothing", {}).get("filter", "ema")).lower(),
+        "horizontal_gain": float(config.get("calibration", {}).get("horizontal_gain", 1.0)),
+        "vertical_gain": float(config.get("calibration", {}).get("vertical_gain", 1.0)),
+        "horizontal_offset": float(config.get("calibration", {}).get("horizontal_offset", 0.0)),
+        "vertical_offset": float(config.get("calibration", {}).get("vertical_offset", 0.0)),
+        "show_debug": bool(args.show_debug),
+    }
+
+
+def print_startup_summary(summary: dict[str, Any]) -> None:
+    print("VisiMove startup summary")
+    print(f"  detector_backend: {summary['detector_backend']}")
+    print(f"  gaze_backend: {summary['gaze_backend']}")
+    print(f"  effective_gaze_backend: {summary['effective_gaze_backend']}")
+    print(f"  blink_backend: {summary['blink_backend']}")
+    if summary["gaze_backend"] == "eyetrax":
+        print(f"  eyetrax initialized: {'yes' if summary['eyetrax_ready'] else 'no'}")
+        print(f"  eyetrax fallback_to_dummy: {'yes' if summary['gaze_fallback_to_dummy'] else 'no'}")
+        print(f"  eyetrax model path: {summary['eyetrax_model_path']}")
+        print(f"  eyetrax face model path: {summary['eyetrax_face_model_path']}")
+    if summary["gaze_backend"] == "gazefollower":
+        print(f"  gazefollower initialized: {'yes' if summary['gazefollower_ready'] else 'no'}")
+        print(f"  gazefollower fallback_to_dummy: {'yes' if summary['gaze_fallback_to_dummy'] else 'no'}")
+        print(f"  gazefollower model path: {summary['gazefollower_model_path']}")
+        print(f"  gazefollower face model path: {summary['gazefollower_face_model_path']}")
+        missing = summary.get("gazefollower_missing_dependencies", ())
+        if missing:
+            print(f"  gazefollower missing dependencies: {', '.join(missing)}")
+    print(f"  calibration profile path: {summary['calibration_profile_path']}")
+    print(f"  calibration loaded: {'yes' if summary['calibration_loaded'] else 'no'}")
+    print(f"  calibration model type: {summary['calibration_model_type']}")
+    print(f"  calibration gaze_backend: {summary['calibration_gaze_backend']}")
+    print(f"  calibration detector_backend: {summary['calibration_detector_backend']}")
+    print(
+        "  calibration screen size: "
+        f"{summary['calibration_screen_width']}x{summary['calibration_screen_height']}"
+    )
+    print(f"  current screen size: {summary['current_screen_width']}x{summary['current_screen_height']}")
+    print(f"  calibration timestamp: {summary['calibration_timestamp']}")
+    print(f"  calibration quality: {summary['calibration_quality']}")
+    print(f"  calibration raw domain: {summary['calibration_raw_domain']}")
+    warnings = summary.get("calibration_warnings", [])
+    if warnings:
+        print(f"  calibration warnings: {len(warnings)}")
+    print(f"  cursor_enabled: {'yes' if summary['cursor_enabled'] else 'no'}")
+    print(f"  dummy cursor allowed: {'yes' if summary['dummy_cursor_allowed'] else 'no'}")
+    print(f"  camera index: {summary['camera_index']}")
+    print(f"  frame size: {summary['frame_size']}")
+    print(f"  smoothing method: {summary['smoothing_method']}")
+    print(
+        "  axis tuning: "
+        f"horizontal_gain={summary['horizontal_gain']:.2f}, "
+        f"vertical_gain={summary['vertical_gain']:.2f}, "
+        f"horizontal_offset={summary['horizontal_offset']:.1f}, "
+        f"vertical_offset={summary['vertical_offset']:.1f}"
+    )
+    if summary["show_debug"]:
+        print(f"  dummy cursor blocked: {'yes' if summary['dummy_cursor_blocked'] else 'no'}")
+
+
+def get_eyetrax_setup_status(config: dict[str, Any]) -> EyeTraxSetupStatus:
+    if get_gaze_backend(config) != "eyetrax":
+        return EyeTraxSetupStatus(ready=True, reason="not selected")
+    eyetrax_config = dict(config.get("eyetrax", {}))
+    gaze_config = config.get("gaze", {})
+    model_path = gaze_config.get("model_path") or eyetrax_config.get("model_path")
+    return EyeTraxAdapter.check_setup(
+        repo_path=eyetrax_config.get("repo_path", "external/eyetrax"),
+        model_path=model_path or "models/gaze/eyetrax",
+        face_landmarker_model_path=eyetrax_config.get(
+            "face_landmarker_model_path",
+            "models/detection/face_landmarker.task",
+        ),
+    )
+
+
+def get_gazefollower_setup_status(config: dict[str, Any]) -> GazeFollowerSetupStatus:
+    if get_gaze_backend(config) != "gazefollower":
+        return GazeFollowerSetupStatus(ready=True, reason="not selected")
+    gazefollower_config = dict(config.get("gazefollower", {}))
+    gaze_config = config.get("gaze", {})
+    model_path = gaze_config.get("model_path") or gazefollower_config.get("model_path")
+    return GazeFollowerAdapter.check_setup(
+        repo_path=gazefollower_config.get("repo_path", "external/gazefollower"),
+        model_path=model_path,
+        face_model_path=gazefollower_config.get("face_model_path"),
+        face_alignment_backend=str(gazefollower_config.get("face_alignment_backend", "blazeface")),
+    )
+
+
+def apply_external_fallback_cursor_gate(
+    config: dict[str, Any],
+    startup: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    if not args.enable_cursor or args.allow_dummy_cursor:
+        return
+    if startup["gaze_backend"] == "eyetrax" and not startup["eyetrax_ready"]:
+        config.setdefault("cursor", {})["enabled"] = False
+        config.setdefault("pipeline", {})["dry_run"] = True
+    if startup["gaze_backend"] == "gazefollower" and not startup["gazefollower_ready"]:
+        config.setdefault("cursor", {})["enabled"] = False
+        config.setdefault("pipeline", {})["dry_run"] = True
+
+
+def print_gaze_backend_warnings(summary: dict[str, Any], args: argparse.Namespace) -> None:
+    if summary["gaze_backend"] == "gazefollower":
+        if summary["gazefollower_ready"]:
+            print("GazeFollower backend selected and setup checks passed. Preview/debug mode is recommended first.")
+            return
+        print(f"GazeFollower backend unavailable: {summary['gazefollower_reason']}")
+        if summary["gaze_fallback_to_dummy"]:
+            print("GazeFollower fallback: dummy gaze will be used for preview/testing.")
+        if args.enable_cursor and not args.allow_dummy_cursor:
+            print(
+                "GazeFollower safety: cursor movement is disabled because GazeFollower is unavailable "
+                "and fallback gaze is dummy. Use --allow-dummy-cursor only for controlled pipeline testing."
+            )
+        return
+
+    if summary["gaze_backend"] != "eyetrax":
+        return
+    if summary["eyetrax_ready"]:
+        print("EyeTrax backend selected and setup checks passed. Preview/debug mode is recommended first.")
+        return
+
+    print(f"EyeTrax backend unavailable: {summary['eyetrax_reason']}")
+    if summary["gaze_fallback_to_dummy"]:
+        print("EyeTrax fallback: dummy gaze will be used for preview/testing.")
+    if args.enable_cursor and not args.allow_dummy_cursor:
+        print(
+            "EyeTrax safety: cursor movement is disabled because EyeTrax is unavailable "
+            "and fallback gaze is dummy. Use --allow-dummy-cursor only for controlled pipeline testing."
+        )
+
+
+def resolve_project_path(path_value: object) -> Path:
+    path = Path(str(path_value))
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def resolve_calibration_path(config: dict[str, Any]) -> Path | None:
+    configured = config.get("calibration", {}).get("profile_path")
+    if configured:
+        return resolve_project_path(configured)
+    fallback = PROJECT_ROOT / "data" / "calibration" / "user_profile.json"
+    return fallback if fallback.exists() else None
+
+
+def load_profile_if_available(path: Path | None) -> tuple[CalibrationProfile | None, str | None]:
+    if path is None:
+        return None, None
+    if not path.exists():
+        return None, None
+    try:
+        return load_calibration_profile(path), None
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        return None, str(exc)
+
+
+def calibration_mismatch_reasons(
+    profile: CalibrationProfile | None,
+    current_gaze_backend: str,
+    current_detector_backend: str,
+    current_screen: ScreenBounds,
+) -> list[str]:
+    if profile is None:
+        return ["missing profile"]
+
+    reasons: list[str] = []
+    profile_gaze = profile.gaze_backend.lower()
+    profile_detector = profile.detector_backend.lower()
+    if profile_gaze == "dummy":
+        reasons.append("profile was created with dummy gaze")
+    elif profile_gaze not in {"unknown", current_gaze_backend}:
+        reasons.append(f"profile gaze_backend {profile.gaze_backend} != current {current_gaze_backend}")
+
+    if profile_detector not in {"unknown", current_detector_backend}:
+        reasons.append(
+            f"profile detector_backend {profile.detector_backend} != current {current_detector_backend}"
+        )
+
+    if profile.screen_width != current_screen.width or profile.screen_height != current_screen.height:
+        reasons.append(
+            "profile screen size "
+            f"{profile.screen_width}x{profile.screen_height} != current "
+            f"{current_screen.width}x{current_screen.height}"
+        )
+    return reasons
+
+
+def apply_calibration_cursor_gate(
+    config: dict[str, Any],
+    startup: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    if not args.enable_cursor or args.allow_dummy_cursor:
+        return
+    reasons = list(startup.get("calibration_mismatch_reasons", []))
+    quality = str(startup.get("calibration_quality", "unknown")).lower()
+    allow_acceptable = bool(config.get("calibration", {}).get("allow_acceptable_calibration_for_cursor", True))
+    if quality == "acceptable" and not allow_acceptable:
+        reasons.append("calibration quality is acceptable but config disallows cursor use")
+    if quality in {"poor", "needs_review"} and not bool(getattr(args, "allow_low_quality_calibration", False)):
+        reasons.append(f"calibration quality is {quality}")
+    if not reasons:
+        return
+    config.setdefault("cursor", {})["enabled"] = False
+    config.setdefault("pipeline", {})["dry_run"] = True
+
+
+def apply_calibration_runtime_metadata(config: dict[str, Any], startup: dict[str, Any]) -> None:
+    calibration_config = config.setdefault("calibration", {})
+    calibration_config["quality"] = startup.get("calibration_quality", "unknown")
+    calibration_config["warnings"] = startup.get("calibration_warnings", [])
+
+
+def print_calibration_warnings(summary: dict[str, Any]) -> None:
+    if summary["calibration_load_error"]:
+        print(f"Calibration warning: could not load profile. {summary['calibration_load_error']}")
+    if not summary["calibration_loaded"]:
+        print("Calibration warning: no calibration profile is loaded. Cursor movement will stay disabled.")
+    for reason in summary["calibration_mismatch_reasons"]:
+        if reason == "missing profile":
+            continue
+        print(f"Calibration warning: {reason}. Recalibrate before real cursor control.")
+    quality = str(summary.get("calibration_quality", "unknown")).lower()
+    if quality in {"poor", "needs_review"}:
+        print(
+            f"Calibration warning: profile quality is {quality}. "
+            "Review calibration diagnostics before enabling cursor."
+        )
+    for warning in summary.get("calibration_warnings", []):
+        print(f"Calibration quality warning: {warning}")
+    if summary["calibration_mismatch_reasons"] and not summary["dummy_cursor_allowed"]:
+        print(
+            "Calibration safety: cursor movement is disabled because calibration is missing or mismatched. "
+            "Use --allow-dummy-cursor only for controlled pipeline testing."
+        )
+    if quality in {"poor", "needs_review"} and not summary["dummy_cursor_allowed"]:
+        print(
+            "Calibration safety: cursor movement is disabled for low-quality calibration unless "
+            "--allow-low-quality-calibration is passed for careful testing."
+        )
+
+
+def print_axis_tuning_warnings(config: dict[str, Any]) -> None:
+    calibration_config = config.get("calibration", {})
+    horizontal_gain = float(calibration_config.get("horizontal_gain", 1.0))
+    vertical_gain = float(calibration_config.get("vertical_gain", 1.0))
+    if horizontal_gain > 2.0 or vertical_gain > 2.0:
+        print(
+            "Axis tuning warning: gain above 2.0 can amplify noise and cursor jumps. "
+            "Preview with --show-debug before enabling cursor."
+        )
+
+
+def calibration_raw_domain(profile: CalibrationProfile | None) -> str:
+    if profile is None:
+        return "none"
+    values = (profile.raw_x_min, profile.raw_x_max, profile.raw_y_min, profile.raw_y_max)
+    if any(value is None for value in values):
+        return "unknown"
+    return (
+        f"x[{float(profile.raw_x_min):.3f},{float(profile.raw_x_max):.3f}],"
+        f"y[{float(profile.raw_y_min):.3f},{float(profile.raw_y_max):.3f}]"
+    )
+
+
+def warn_if_calibration_profile_is_degenerate(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print(f"Calibration warning: could not read {path}.")
+        return
+
+    samples = data.get("raw_gaze_samples", [])
+    unique_raw = {
+        tuple(round(float(value), 4) for value in sample.get("raw_gaze", []))
+        for sample in samples
+        if len(sample.get("raw_gaze", [])) == 2
+    }
+    if samples and len(unique_raw) < 3:
+        print(
+            "Calibration warning: user_profile.json appears degenerate "
+            f"({len(samples)} samples, {len(unique_raw)} unique raw gaze values). "
+            "Rerun calibration after connecting a real gaze backend."
+        )
+
+
+if __name__ == "__main__":
+    main()

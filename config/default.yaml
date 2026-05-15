@@ -1,0 +1,108 @@
+camera:
+  index: 0
+  width: 1280
+  height: 720
+  fps: 30
+
+calibration:
+  profile_path: data/calibration/user_profile.json
+  mapping_model: affine
+  mapping_model_type: affine
+  clamp_output: true
+  stabilization_ms: 800
+  collection_ms: 2500
+  min_valid_samples_per_point: 15
+  max_collection_ms_per_point: 4500
+  sample_interval_ms: 0
+  allow_acceptable_calibration_for_cursor: true
+  clamp_raw_input_to_calibration_domain: true
+  raw_domain_margin: 0.05
+  block_cursor_when_outside_calibration_domain: true
+  live_domain_violation_ratio_threshold: 0.30
+  live_domain_window_size: 30
+  horizontal_gain: 1.0
+  vertical_gain: 1.0
+  horizontal_offset: 0.0
+  vertical_offset: 0.0
+  center_bias_correction: true
+  allow_axis_gain_tuning: true
+
+detection:
+  detector_backend: auto
+  backend: auto
+  min_face_confidence: 0.6
+  min_eye_confidence: 0.6
+  min_tracking_confidence: 0.6
+  face_landmarker_model_path: models/detection/face_landmarker.task
+  reuse_frames: 2
+  yolo_model_path: models/detection/yolo_face_eye.onnx
+  yolo_confidence_threshold: 0.4
+  yolo_image_size: 640
+  yolo_device: cpu
+  yolo_detect_every_n_frames: 3
+
+gaze:
+  gaze_backend: dummy
+  backend: dummy
+  model_path: null
+  fallback_to_dummy: true
+  confidence_threshold: 0.5
+
+eyetrax:
+  repo_path: external/eyetrax
+  model_path: models/gaze/eyetrax
+  face_landmarker_model_path: models/detection/face_landmarker.task
+  use_gpu: false
+  input_size: null
+
+gazefollower:
+  repo_path: external/gazefollower
+  model_path: external/gazefollower/gazefollower/res/model_weights/base.mnn
+  face_model_path: external/gazefollower/gazefollower/res/model_weights/blaze_face.mnn
+  face_alignment_backend: blazeface
+  use_calibrated_output: false
+
+blink:
+  backend: dummy
+  model_path: null
+  input_width: 64
+  input_height: 64
+  normalize_mean: 0.5
+  normalize_std: 0.5
+  ear_threshold: 0.21
+  closed_threshold: 0.65
+  min_blink_ms: 150
+  max_blink_ms: 600
+  long_blink_ms: 800
+  long_blink_event: right_click
+  double_blink_gap_ms: 450
+  click_cooldown_ms: 1000
+
+cursor:
+  enabled: false
+  backend: pyautogui
+  movement_gain: 1.0
+  movement_duration_sec: 0.03
+  max_speed_px_per_sec: 1400
+  min_gaze_confidence: 0.65
+  click_cooldown_ms: 500
+  start_paused: true
+  emergency_pause_key: p
+  dwell_enabled: true
+  dwell_time_ms: 900
+  dwell_radius_px: 35
+
+smoothing:
+  filter: ema
+  ema_alpha: 0.35
+  alpha: 0.35
+  deadzone_radius: 8
+  max_jump_pixels: 180
+  fixation_duration_ms: 180
+  fixation_radius: 18
+  kalman_process_noise: 0.01
+  kalman_measurement_noise: 4.0
+
+pipeline:
+  show_preview: true
+  dry_run: true

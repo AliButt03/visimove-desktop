@@ -1,0 +1,19 @@
+calibration:
+  mode: "9"
+  stabilization_seconds: 0.75
+  sample_seconds: 1.7
+  stabilization_ms: 800
+  collection_ms: 2500
+  min_valid_samples_per_point: 15
+  max_collection_ms_per_point: 4500
+  sample_interval_ms: 0
+  clamp_raw_input_to_calibration_domain: true
+  raw_domain_margin: 0.05
+  block_cursor_when_outside_calibration_domain: true
+  live_domain_violation_ratio_threshold: 0.30
+  live_domain_window_size: 30
+  output_path: data/calibration/user_profile.json
+  mapping_model: affine
+  mapping_model_type: affine
+  ridge_alpha: 1.0
+  polynomial_degree: 2
