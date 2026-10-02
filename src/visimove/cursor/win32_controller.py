@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 
 from visimove.cursor.cursor_safety import CursorSafety
 from visimove.utils.screen import get_screen_bounds
@@ -12,6 +13,7 @@ class Win32CursorController:
     def __init__(self, safety: CursorSafety | None = None) -> None:
         self.safety = safety or CursorSafety(bounds=get_screen_bounds())
         self.user32 = ctypes.windll.user32
+        self.safety.reset_motion(self._current_position())
 
     def move_to(
         self,
@@ -53,6 +55,12 @@ class Win32CursorController:
 
     def resume(self) -> None:
         self.safety.resume()
+        self.safety.reset_motion(self._current_position())
+
+    def _current_position(self) -> tuple[int, int]:
+        point = wintypes.POINT()
+        self.user32.GetCursorPos(ctypes.byref(point))
+        return int(point.x), int(point.y)
 
     def click(self) -> None:
         self.left_click()

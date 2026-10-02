@@ -34,6 +34,10 @@ class CursorSafety:
         self._last_position = current_position
         self._last_move_at = monotonic()
 
+    @property
+    def current_position(self) -> tuple[int, int] | None:
+        return self._last_position
+
     def can_move(self, gaze_confidence: float, target_visible: bool) -> bool:
         return (
             not self.paused
@@ -87,4 +91,3 @@ class CursorSafety:
             return target
         scale = max_distance / distance
         return round(origin[0] + dx * scale), round(origin[1] + dy * scale)
-

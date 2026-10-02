@@ -1,41 +1,28 @@
+"""Compatibility exports for optional gaze backend adapters.
+
+The real adapter implementations live in backend-specific modules. This module
+keeps older imports such as ``visimove.gaze.adapters.MobileGazeAdapter`` working
+without routing callers to stale placeholder classes.
+"""
+
 from __future__ import annotations
 
-from visimove.external_backends import require_external_repo
-from visimove.types import DetectionResult, Frame, GazeEstimate
+from visimove.gaze.eyetrax_adapter import EyeTraxAdapter, EyeTraxAdapterConfig, EyeTraxSetupStatus
+from visimove.gaze.gazefollower_adapter import (
+    GazeFollowerAdapter,
+    GazeFollowerAdapterConfig,
+    GazeFollowerSetupStatus,
+)
+from visimove.gaze.mobilegaze_adapter import MobileGazeAdapter, MobileGazeAdapterConfig, MobileGazeSetupStatus
 
-
-class GazeFollowerAdapter:
-    """Adapter shell for the optional gazefollower backend."""
-
-    backend_name = "gazefollower"
-
-    def __init__(self) -> None:
-        self.repo_path = require_external_repo(self.backend_name)
-
-    def estimate(self, frame: Frame, detection: DetectionResult) -> GazeEstimate:
-        raise NotImplementedError("Wire gazefollower inference here after setup is documented.")
-
-
-class EyeTraxAdapter:
-    """Adapter shell for the optional eyetrax backend."""
-
-    backend_name = "eyetrax"
-
-    def __init__(self) -> None:
-        self.repo_path = require_external_repo(self.backend_name)
-
-    def estimate(self, frame: Frame, detection: DetectionResult) -> GazeEstimate:
-        raise NotImplementedError("Wire eyetrax inference here after setup is documented.")
-
-
-class MobileGazeAdapter:
-    """Adapter shell for the optional mobilegaze backend."""
-
-    backend_name = "mobilegaze"
-
-    def __init__(self) -> None:
-        self.repo_path = require_external_repo(self.backend_name)
-
-    def estimate(self, frame: Frame, detection: DetectionResult) -> GazeEstimate:
-        raise NotImplementedError("Wire mobilegaze inference here after setup is documented.")
-
+__all__ = [
+    "EyeTraxAdapter",
+    "EyeTraxAdapterConfig",
+    "EyeTraxSetupStatus",
+    "GazeFollowerAdapter",
+    "GazeFollowerAdapterConfig",
+    "GazeFollowerSetupStatus",
+    "MobileGazeAdapter",
+    "MobileGazeAdapterConfig",
+    "MobileGazeSetupStatus",
+]

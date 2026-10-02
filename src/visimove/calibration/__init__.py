@@ -22,6 +22,8 @@ from visimove.calibration.axis_adjustment import (
 )
 from visimove.calibration.mapping_model import (
     AffineMappingModel,
+    GridMappingModel,
+    InverseDistanceMappingModel,
     LinearRegressionMappingModel,
     MappingModelType,
     PolynomialRegressionMappingModel,
@@ -37,7 +39,14 @@ from visimove.calibration.mapping_diagnostics import (
 )
 from visimove.calibration.live_quality import LiveTrackingQualityMonitor, LiveTrackingQualityState
 from visimove.calibration.mapper import CalibrationMapper, MappingDebugInfo, RawCalibrationDomain, RawDomainCheck
-
+from visimove.calibration.demo_tuning import (
+    DemoTargetSample,
+    DemoTuningProfile,
+    apply_demo_tuning_profile,
+    create_demo_tuning_profile,
+    load_demo_tuning_profile,
+    save_demo_tuning_profile,
+)
 __all__ = [
     "CalibrationMapper",
     "AxisAdjustmentConfig",
@@ -54,6 +63,8 @@ __all__ = [
     "CalibrationQualityReport",
     "CalibrationSample",
     "AffineMappingModel",
+    "GridMappingModel",
+    "InverseDistanceMappingModel",
     "LinearRegressionMappingModel",
     "MappingModelType",
     "PolynomialRegressionMappingModel",
@@ -70,4 +81,10 @@ __all__ = [
     "load_calibration_profile",
     "new_profile",
     "save_calibration_profile",
+    "save_demo_tuning_profile",
+    "load_demo_tuning_profile",
+    "create_demo_tuning_profile",
+    "apply_demo_tuning_profile",
+    "DemoTuningProfile",
+    "DemoTargetSample",
 ]

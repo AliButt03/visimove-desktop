@@ -71,6 +71,8 @@ File: `src/visimove/tests/test_mapping_model.py`
 - `test_ridge_mapping_serializes_parameters`
 - `test_polynomial_mapping_fit_predict`
 - `test_affine_mapping_predicts_varied_y_for_varied_raw_y`
+- `test_idw_mapping_is_bounded_by_control_targets`
+- `test_idw_mapping_serializes_control_points`
 
 Coverage:
 
@@ -78,6 +80,7 @@ Coverage:
 - Ridge regression parameter serialization and restore.
 - Polynomial regression fit and prediction.
 - Affine mapping preserves Y variation for varied raw Y values.
+- IDW mapping predicts exact calibration controls and stays bounded by calibration target points.
 
 File: `src/visimove/tests/test_mapping_diagnostics.py`
 
@@ -1445,3 +1448,477 @@ Result:
 ```text
 short smoke run no longer reports the GazeFollower MediaPipe import error; ended by timeout because tracking runs continuously
 ```
+
+## 2026-05-16 - GazeFollower Native Coordinate Normalization
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+```
+
+Result:
+
+```text
+compile passed
+```
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+```
+
+Result:
+
+```text
+92 passed in 5.94s
+```
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+```
+
+Result:
+
+```text
+run_tracking help passed
+```
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -c "from visimove.config import load_config; from visimove.pipeline.realtime_pipeline import build_gaze_backend_config; cfg=load_config('config/default.yaml'); cfg['gaze']['gaze_backend']='gazefollower'; cfg['gaze']['backend']='gazefollower'; print(build_gaze_backend_config(cfg)['native_output_mode'], build_gaze_backend_config(cfg)['native_coordinate_scale_x'], build_gaze_backend_config(cfg)['native_coordinate_scale_y'])"
+```
+
+Result:
+
+```text
+model_coordinates 10.0 10.0
+```
+
+## 2026-05-16 - MobileGaze ONNX Preview Adapter
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -c "from visimove.config import load_config; from visimove.pipeline.realtime_pipeline import build_gaze_backend_config, build_gaze_model; cfg=load_config('config/default.yaml'); cfg['gaze']['gaze_backend']='mobilegaze'; cfg['gaze']['backend']='mobilegaze'; model=build_gaze_model(build_gaze_backend_config(cfg)); model._initialize(); print(type(model).__name__, getattr(model, '_initialized', False), model._input_size, model._output_names)"
+```
+
+Result:
+
+```text
+MobileGazeAdapter True (448, 448) ['yaw', 'pitch']
+```
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+```
+
+Result:
+
+```text
+compile passed
+96 passed in 4.45s
+run_tracking help passed
+```
+
+## 2026-05-16 - MobileGaze Horizontal Axis Sign Fix
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+```
+
+Result:
+
+```text
+compile passed
+96 passed in 4.79s
+run_tracking help passed
+```
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -c "from visimove.gaze.mobilegaze_adapter import MobileGazeAdapter; import numpy as np; print('left', MobileGazeAdapter._angles_to_raw(np.radians(-45),0)); print('center', MobileGazeAdapter._angles_to_raw(0,0)); print('right', MobileGazeAdapter._angles_to_raw(np.radians(45),0))"
+```
+
+Result:
+
+```text
+left (0.0, 0.5)
+center (0.5, 0.5)
+right (1.0, 0.5)
+```
+
+## 2026-05-16 - MobileGaze Calibration Provider
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+.\.venv\Scripts\python.exe scripts\run_calibration.py --help
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+```
+
+Result:
+
+```text
+compile passed
+96 passed in 4.32s
+run_calibration help passed
+run_tracking help passed
+```
+
+## 2026-05-16 - MobileGaze Live Diagnostic Profile Selection
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+.\.venv\Scripts\python.exe scripts\diagnose_live_gaze.py --help
+```
+
+Result:
+
+```text
+compile passed
+98 passed in 5.90s
+diagnose_live_gaze help passed
+```
+
+Coverage added:
+
+- `diagnose_live_gaze.py --gaze-backend mobilegaze` auto-loads `data/calibration/user_profile_mobilegaze.json` when present.
+- Explicit `--calibration-profile` still overrides backend-specific profile defaults.
+
+## 2026-05-16 - Runtime Mapping Input Domain Clamp
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+.\.venv\Scripts\python.exe scripts\diagnose_live_gaze.py --help
+```
+
+Result:
+
+```text
+compile passed
+100 passed in 8.17s
+run_tracking help passed
+diagnose_live_gaze help passed
+```
+
+Coverage added:
+
+- Mapping models serialize fitted raw input min/max for newly trained profiles.
+- Existing affine profiles can derive the fitted mapping input domain from coefficients and target coordinates.
+- Runtime mapping clamps to the fitted mapping input domain to reduce off-screen affine extrapolation.
+
+## 2026-05-16 - Safe Edge Reach Mapping
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+```
+
+Result:
+
+```text
+compile passed
+run_tracking help passed
+104 passed in 4.89s
+```
+
+Coverage added:
+
+- Edge-reach expansion maps the inset calibrated target rectangle to full-screen edges.
+- Edge-reach expansion respects a configured edge margin.
+- CLI overrides cover `--edge-reach` and `--edge-margin-px`.
+
+## 2026-05-17 - Adaptive Stabilization
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+```
+
+Result:
+
+```text
+compile passed
+run_tracking help passed
+107 passed in 15.52s
+```
+
+Coverage added:
+
+- Adaptive smoothing moves faster for large intentional cursor moves.
+- Adaptive smoothing holds small fixation jitter after the configured hold time.
+- CLI overrides cover adaptive smoothing parameters.
+
+## 2026-05-17 - Edge Boost Tuning
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+```
+
+Result:
+
+```text
+compile passed
+run_tracking help passed
+108 passed in 4.29s
+```
+
+Coverage added:
+
+- Edge boost pushes near-edge output toward screen boundaries.
+- CLI overrides cover `--edge-boost` and `--edge-boost-gamma`.
+
+## 2026-05-18 - MobileGaze Mapping Quality Guard
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m json.tool docs\PROJECT_STATE.json
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+.\.venv\Scripts\python.exe scripts\diagnose_calibration_mapping.py --profile data\calibration\user_profile_mobilegaze.json
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+```
+
+Coverage added:
+
+- MobileGaze calibration can use `auto` mapping selection.
+- Auto mapping selection chooses the candidate with the lowest point-mean screen error.
+- Mapping diagnostics preserve calibration collection order.
+- High mapping error downgrades calibration quality from `good` to `needs_review`.
+- Startup rechecks saved profile mapping diagnostics so old inaccurate profiles are blocked from cursor control by default.
+
+Result:
+
+```text
+compile passed
+PROJECT_STATE.json valid
+run_tracking help passed
+diagnose_calibration_mapping warning check passed
+118 passed in 4.30s
+```
+
+## 2026-05-18 - MobileGaze Raw-Sample Mapping Stability Guard
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+.\.venv\Scripts\python.exe scripts\run_calibration.py --help
+.\.venv\Scripts\python.exe scripts\diagnose_calibration_mapping.py --profile data\calibration\user_profile_mobilegaze.json
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+```
+
+Coverage added:
+
+- Mapping diagnostics now report raw-sample mean absolute error and raw-sample clipping ratio.
+- Calibration quality flags profiles whose raw samples map outside the screen even when point-mean diagnostics look good.
+- Auto mapping selection penalizes candidates that fit point means but map raw calibration samples off-screen.
+
+Result:
+
+```text
+compile passed
+run_tracking help passed
+run_calibration help passed
+diagnose_calibration_mapping now flags current polynomial profile as needs-review-worthy
+120 passed in 4.53s
+```
+
+## 2026-05-18 - MobileGaze Bounded IDW Mapping
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+.\.venv\Scripts\python.exe scripts\run_calibration.py --help
+.\.venv\Scripts\python.exe scripts\diagnose_calibration_mapping.py --profile data\calibration\user_profile_mobilegaze.json
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+```
+
+Coverage added:
+
+- Added bounded `idw` calibration mapping for noisy MobileGaze point-mean profiles.
+- MobileGaze `auto` mapping now evaluates `idw` before polynomial, linear, and affine.
+- IDW serialization/deserialization preserves control raw points and target screen points.
+- Current MobileGaze samples select `idw` in dry-run scoring and avoid raw-sample off-screen predictions.
+
+Result:
+
+```text
+compile passed
+PROJECT_STATE.json valid
+run_tracking help passed
+run_calibration help passed
+diagnose_calibration_mapping confirms the saved profile is still affine/needs review until recalibration
+122 passed in 13.89s
+```
+
+## 2026-05-18 - MobileGaze Grid Mapping Candidate
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m json.tool docs\PROJECT_STATE.json
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+.\.venv\Scripts\python.exe scripts\run_calibration.py --help
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+```
+
+Coverage added:
+
+- Added bounded `grid` calibration mapping.
+- MobileGaze `auto` mapping now evaluates `grid` before IDW, polynomial, linear, and affine.
+- Grid serialization/deserialization preserves row and column calibration knots.
+- Current MobileGaze samples select `grid` in dry-run scoring and keep raw-sample clipping at `0%`.
+
+Result:
+
+```text
+compile passed
+PROJECT_STATE.json valid
+run_tracking help passed
+run_calibration help passed
+124 passed in 5.79s
+```
+
+### 2026-05-25 - Revert Median-Window Cursor Tuning
+
+Commands:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp src\visimove\tests\test_smoothing.py src\visimove\tests\test_run_tracking_startup.py
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+```
+
+Result:
+
+```text
+compile passed
+29 focused tests passed in 3.20s
+126 passed in 4.75s
+```
+
+### 2026-05-25 - Relax Unstable Live-Quality Cursor Gate
+
+Commands:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp src\visimove\tests\test_realtime_live_safety.py src\visimove\tests\test_live_quality.py src\visimove\tests\test_smoothing.py
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+```
+
+Result:
+
+```text
+compile passed
+18 focused tests passed in 0.49s
+127 passed in 4.98s
+run_tracking help passed
+```
+
+### 2026-05-25 - Adaptive Large-Jump Confirmation
+
+Commands:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp src\visimove\tests\test_smoothing.py
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp src\visimove\tests\test_realtime_live_safety.py src\visimove\tests\test_live_quality.py src\visimove\tests\test_run_tracking_startup.py src\visimove\tests\test_smoothing.py
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+```
+
+Coverage added:
+
+- Adaptive smoothing holds isolated large target spikes as `confirming`.
+- Adaptive smoothing accepts a large jump after the target repeats within the confirmation radius.
+- Existing immediate large-motion behavior is still available when confirmation samples are set to `1`.
+
+Result:
+
+```text
+compile passed
+14 smoothing tests passed in 1.02s
+37 focused tests passed in 3.43s
+129 passed in 6.11s
+run_tracking help passed
+```
+
+### 2026-05-25 - Adaptive Edge Catch-Up
+
+Commands:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp src\visimove\tests\test_smoothing.py
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp src\visimove\tests\test_realtime_live_safety.py src\visimove\tests\test_live_quality.py src\visimove\tests\test_run_tracking_startup.py src\visimove\tests\test_smoothing.py
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp .pytest-tmp
+.\.venv\Scripts\python.exe scripts\run_tracking.py --help
+```
+
+Coverage added:
+
+- Adaptive smoothing uses faster catch-up for confirmed physical edge targets.
+- Adaptive smoothing snaps the final few pixels when already close to a physical edge.
+- Edge behavior is only enabled when screen bounds are supplied by the real-time pipeline.
+
+Result:
+
+```text
+compile passed
+16 smoothing tests passed in 0.26s
+39 focused tests passed in 2.90s
+131 passed in 4.67s
+run_tracking help passed
+```
+
+## Velocity Cursor And Dwell Tests
+
+Files:
+
+- src/visimove/tests/test_velocity_control.py
+- src/visimove/tests/test_dwell.py
+- src/visimove/tests/test_realtime_live_safety.py
+- src/visimove/tests/test_run_tracking_startup.py
+
+Coverage includes center deadzone hold, bounded incremental motion, long-frame teleport prevention, edge-margin clamping, missing-gaze hold, pause/resume position synchronization, velocity pipeline selection, one-shot dwell behavior, dwell reset, dwell blocking while steering, and release-default configuration.

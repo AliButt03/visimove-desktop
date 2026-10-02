@@ -89,3 +89,92 @@ def test_raw_domain_margin_is_detection_tolerance_not_mapping_input() -> None:
     assert check.status == "inside"
     assert check.violations == ()
     assert check.mapped_input_y == 0.3
+
+
+def test_mapping_input_domain_clamps_affine_extrapolation_from_old_profile() -> None:
+    profile = CalibrationProfile(
+        timestamp="2026-05-16T00:00:00+00:00",
+        screen_width=2560,
+        screen_height=1440,
+        camera_index=0,
+        calibration_points=[],
+        raw_gaze_samples=[],
+        target_screen_coordinates=[(307, 173), (2252, 1266)],
+        mapping_model_type="affine",
+        mapping_parameters={
+            "model_type": "affine",
+            "coefficients": [
+                [-2793.0, -2010.0],
+                [9078.0, 0.0],
+                [0.0, 4149.0],
+            ],
+        },
+        raw_x_min=0.264,
+        raw_x_max=0.650,
+        raw_y_min=0.381,
+        raw_y_max=0.913,
+        raw_x_range=0.386,
+        raw_y_range=0.532,
+    )
+    mapper = CalibrationMapper.from_profile(profile)
+    mapper.clamp_raw_input_to_calibration_domain = True
+    mapper.clamp_raw_input_to_mapping_domain = True
+
+    mapped, debug = mapper.map_with_debug(GazeEstimate(point=Point(0.650, 0.464), confidence=1.0))
+
+    assert debug.raw_domain_status == "inside"
+    assert debug.mapped_input_x < 0.650
+    assert debug.before_clamp_x <= 2252.1
+    assert mapped.x <= 2253
+    assert mapped.y >= 0
+
+
+def test_mapping_input_domain_clamp_can_be_disabled_for_noisy_live_gaze() -> None:
+    profile = CalibrationProfile(
+        timestamp="2026-05-17T00:00:00+00:00",
+        screen_width=2560,
+        screen_height=1440,
+        camera_index=0,
+        calibration_points=[],
+        raw_gaze_samples=[],
+        target_screen_coordinates=[(307, 173), (2252, 1266)],
+        mapping_model_type="affine",
+        mapping_parameters={
+            "model_type": "affine",
+            "coefficients": [
+                [-2789.5, -2023.5],
+                [9069.6, 0.0],
+                [0.0, 4160.0],
+            ],
+            "input_min": [0.268, 0.645],
+            "input_max": [0.471, 0.876],
+        },
+        raw_x_min=0.076,
+        raw_x_max=0.607,
+        raw_y_min=0.515,
+        raw_y_max=1.0,
+        raw_x_range=0.531,
+        raw_y_range=0.485,
+    )
+    mapper = CalibrationMapper.from_profile(profile)
+    mapper.clamp_raw_input_to_calibration_domain = True
+    mapper.clamp_raw_input_to_mapping_domain = False
+
+    _mapped, debug = mapper.map_with_debug(GazeEstimate(point=Point(0.400, 0.570), confidence=1.0))
+
+    assert debug.raw_domain_status == "inside"
+    assert debug.mapped_input_x == 0.400
+    assert debug.mapped_input_y == 0.570
+    assert debug.before_clamp_y > 173
+
+
+def test_mapping_model_serializes_fitted_input_domain() -> None:
+    from visimove.calibration.mapping_model import create_mapping_model
+
+    model = create_mapping_model("affine")
+    model.fit(raw_gaze=[(0.3, 0.5), (0.6, 0.8)], targets=[(100, 200), (900, 700)])
+
+    parameters = model.to_parameters()
+
+    assert parameters["input_min"] == [0.3, 0.5]
+    assert parameters["input_max"] == [0.6, 0.8]

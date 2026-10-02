@@ -28,7 +28,11 @@ class PyAutoGuiCursorController:
     ) -> None:
         target = self.safety.safe_target(x, y, gaze_confidence, target_visible)
         if target is not None:
-            self._pyautogui.moveTo(*target, duration=self.movement_duration_sec)
+            try:
+                self._pyautogui.moveTo(*target, duration=self.movement_duration_sec)
+            except self._pyautogui.FailSafeException:
+                self.safety.pause()
+                print("Cursor paused: PyAutoGUI fail-safe detected a screen corner. Move the mouse away, then press 'p' to resume.")
 
     def left_click(self) -> None:
         if self.safety.can_click():

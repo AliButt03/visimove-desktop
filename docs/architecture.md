@@ -78,7 +78,12 @@ gazefollower:
   model_path: external/gazefollower/gazefollower/res/model_weights/base.mnn
   face_model_path: external/gazefollower/gazefollower/res/model_weights/blaze_face.mnn
   face_alignment_backend: blazeface
+  native_output_mode: model_coordinates
+  native_coordinate_scale_x: 10.0
+  native_coordinate_scale_y: 10.0
 ```
+
+GazeFollower's external `raw_gaze_coordinates` are the first two values of the MNN model output. They are not Windows screen pixels. The adapter exposes them as `native_gaze` with `native_units=gazefollower_model_coordinates` and maps them into VisiMove's 0..1 raw space with a configurable centered transform before any VisiMove calibration.
 
 ```yaml
 gaze:
@@ -95,8 +100,18 @@ eyetrax:
 ```yaml
 gaze:
   gaze_backend: mobilegaze
-  model_path: models/gaze/mobilegaze/model.onnx
+
+mobilegaze:
+  repo_path: external/mobilegaze
+  model_path: external/mobilegaze/weights/mobileone_s0_gaze.onnx
+  yaw_range_deg: 45.0
+  pitch_range_deg: 35.0
+  face_crop_scale: 1.15
+  providers:
+    - CPUExecutionProvider
 ```
+
+MobileGaze uses ONNX Runtime and VisiMove's detector face crop. Its native output is `(yaw, pitch)` in radians. The adapter exposes that as `native_gaze` with `native_units=radians_yaw_pitch`, plus a 3D `gaze_vector`, then maps the angles into normalized raw gaze for preview and VisiMove calibration.
 
 EyeTrax is the first real gaze backend target. Its adapter validates `external/eyetrax`, a saved `gaze_model.pkl`, importable dependencies, and a local MediaPipe `face_landmarker.task` before claiming the backend is ready. If setup is incomplete and `fallback_to_dummy` is true, the pipeline prints a clear message and falls back to `MovingDummyGazeModel` for preview/testing only.
 

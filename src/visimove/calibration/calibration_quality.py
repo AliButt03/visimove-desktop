@@ -37,7 +37,8 @@ def analyze_calibration_quality(
     review_issues: list[str] = []
     valid_samples = [sample for sample in samples if _valid_raw(sample.raw_gaze)]
     counts_by_target = Counter(sample.target_screen for sample in valid_samples)
-    sample_count_per_point = [counts_by_target[target] for target in sorted(counts_by_target)]
+    point_order = _target_order(valid_samples)
+    sample_count_per_point = [counts_by_target[target] for target in point_order]
 
     missing_point_count = max(0, expected_point_count - len(counts_by_target))
     if missing_point_count:
@@ -112,8 +113,16 @@ def analyze_calibration_quality(
     mapped_y_stuck = bool(mapping_diagnostics.get("mapped_y_stuck_at_zero", False))
     clipped_ratio = float(mapping_diagnostics.get("clipped_prediction_ratio", 0.0))
     negative_y_ratio = float(mapping_diagnostics.get("negative_y_before_clamp_ratio", 0.0))
+    sample_clipped_ratio = float(mapping_diagnostics.get("sample_clipped_prediction_ratio", 0.0))
+    sample_negative_y_ratio = float(mapping_diagnostics.get("sample_negative_y_before_clamp_ratio", 0.0))
     mapped_x_range = float(mapping_diagnostics.get("mapped_x_range", 0.0))
     mapped_y_range = float(mapping_diagnostics.get("mapped_y_range", 0.0))
+    mapping_mae_x = _optional_float(mapping_diagnostics.get("mapping_mean_absolute_error_x"))
+    mapping_mae_y = _optional_float(mapping_diagnostics.get("mapping_mean_absolute_error_y"))
+    sample_mapping_mae_x = _optional_float(mapping_diagnostics.get("mapping_sample_mean_absolute_error_x"))
+    sample_mapping_mae_y = _optional_float(mapping_diagnostics.get("mapping_sample_mean_absolute_error_y"))
+    target_x_range = _optional_float(mapping_diagnostics.get("mapping_target_x_range"))
+    target_y_range = _optional_float(mapping_diagnostics.get("mapping_target_y_range"))
     if mapped_y_stuck:
         serious_issues.append("mapped Y is stuck at 0 after calibration")
     if clipped_ratio > 0.5:
@@ -124,10 +133,46 @@ def analyze_calibration_quality(
         serious_issues.append(f"too many predicted Y values are negative before clamping ({negative_y_ratio:.0%})")
     elif negative_y_ratio > 0.25:
         review_issues.append(f"many predicted Y values are negative before clamping ({negative_y_ratio:.0%})")
+    if sample_clipped_ratio > 0.5:
+        serious_issues.append(f"too many raw calibration samples map outside the screen ({sample_clipped_ratio:.0%})")
+    elif sample_clipped_ratio > 0.25:
+        review_issues.append(f"many raw calibration samples map outside the screen ({sample_clipped_ratio:.0%})")
+    if sample_negative_y_ratio > 0.5:
+        serious_issues.append(
+            f"too many raw calibration samples predict negative Y before clamping ({sample_negative_y_ratio:.0%})"
+        )
+    elif sample_negative_y_ratio > 0.25:
+        review_issues.append(
+            f"many raw calibration samples predict negative Y before clamping ({sample_negative_y_ratio:.0%})"
+        )
     if mapping_diagnostics and mapped_x_range < 1.0:
         serious_issues.append("mapped X range is too small after calibration")
     if mapping_diagnostics and mapped_y_range < 1.0:
         serious_issues.append("mapped Y range is too small after calibration")
+    if mapping_mae_x is not None and target_x_range and target_x_range > 0:
+        x_error_ratio = mapping_mae_x / target_x_range
+        if x_error_ratio > 0.30:
+            serious_issues.append(f"mean absolute X error is very high ({mapping_mae_x:.1f}px)")
+        elif x_error_ratio > 0.15:
+            review_issues.append(f"mean absolute X error is high ({mapping_mae_x:.1f}px)")
+    if mapping_mae_y is not None and target_y_range and target_y_range > 0:
+        y_error_ratio = mapping_mae_y / target_y_range
+        if y_error_ratio > 0.30:
+            serious_issues.append(f"mean absolute Y error is very high ({mapping_mae_y:.1f}px)")
+        elif y_error_ratio > 0.15:
+            review_issues.append(f"mean absolute Y error is high ({mapping_mae_y:.1f}px)")
+    if sample_mapping_mae_x is not None and target_x_range and target_x_range > 0:
+        sample_x_error_ratio = sample_mapping_mae_x / target_x_range
+        if sample_x_error_ratio > 0.35:
+            serious_issues.append(f"raw-sample mean absolute X error is very high ({sample_mapping_mae_x:.1f}px)")
+        elif sample_x_error_ratio > 0.20:
+            review_issues.append(f"raw-sample mean absolute X error is high ({sample_mapping_mae_x:.1f}px)")
+    if sample_mapping_mae_y is not None and target_y_range and target_y_range > 0:
+        sample_y_error_ratio = sample_mapping_mae_y / target_y_range
+        if sample_y_error_ratio > 0.35:
+            serious_issues.append(f"raw-sample mean absolute Y error is very high ({sample_mapping_mae_y:.1f}px)")
+        elif sample_y_error_ratio > 0.20:
+            review_issues.append(f"raw-sample mean absolute Y error is high ({sample_mapping_mae_y:.1f}px)")
     for warning in mapping_warnings:
         if warning not in serious_issues and warning not in review_issues:
             review_issues.append(warning)
@@ -202,12 +247,18 @@ def _confidence_stats(values: list[float]) -> dict[str, float | None]:
     return {"min": min(values), "mean": mean(values), "max": max(values)}
 
 
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
 def _point_statistics(samples: list[CalibrationSample]) -> list[dict[str, Any]]:
     stats: list[dict[str, Any]] = []
     grouped: dict[tuple[int, int], list[CalibrationSample]] = {}
     for sample in samples:
         grouped.setdefault(sample.target_screen, []).append(sample)
-    for index, target in enumerate(sorted(grouped), start=1):
+    for index, target in enumerate(_target_order(samples), start=1):
         point_samples = grouped[target]
         raw_x_values = [sample.raw_gaze[0] for sample in point_samples]
         raw_y_values = [sample.raw_gaze[1] for sample in point_samples]
@@ -232,3 +283,14 @@ def _point_statistics(samples: list[CalibrationSample]) -> list[dict[str, Any]]:
             }
         )
     return stats
+
+
+def _target_order(samples: list[CalibrationSample]) -> list[tuple[int, int]]:
+    order: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for sample in samples:
+        if sample.target_screen in seen:
+            continue
+        seen.add(sample.target_screen)
+        order.append(sample.target_screen)
+    return order

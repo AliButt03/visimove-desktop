@@ -11,3 +11,4 @@ screeninfo>=0.8
 pandas>=2.2
 MNN>=2.9.6
 pygame>=2.5
+onnxruntime

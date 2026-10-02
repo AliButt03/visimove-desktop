@@ -59,15 +59,22 @@ def main() -> None:
     print(f"  mean absolute error y: {diagnostics.mean_absolute_error_y:.1f}px")
     print(f"  RMSE x: {diagnostics.rmse_x:.1f}px")
     print(f"  RMSE y: {diagnostics.rmse_y:.1f}px")
+    print(f"  raw-sample mean absolute error x: {diagnostics.sample_mean_absolute_error_x:.1f}px")
+    print(f"  raw-sample mean absolute error y: {diagnostics.sample_mean_absolute_error_y:.1f}px")
     print(f"  mapped X range: {diagnostics.predicted_x_range:.1f}px")
     print(f"  mapped Y range: {diagnostics.predicted_y_range:.1f}px")
     print(f"  clipped prediction ratio: {diagnostics.clipped_prediction_ratio:.0%}")
     print(f"  negative Y before clamp ratio: {diagnostics.negative_y_before_clamp_ratio:.0%}")
+    print(f"  raw-sample clipped prediction ratio: {diagnostics.sample_clipped_prediction_ratio:.0%}")
+    print(f"  raw-sample negative Y before clamp ratio: {diagnostics.sample_negative_y_before_clamp_ratio:.0%}")
     print(f"  mapped Y stuck at 0: {'yes' if diagnostics.mapped_y_stuck_at_zero else 'no'}")
     grouped = defaultdict(list)
+    target_order = []
     for sample in profile.raw_gaze_samples:
+        if sample.target_screen not in grouped:
+            target_order.append(sample.target_screen)
         grouped[sample.target_screen].append(sample)
-    print("  samples per calibration point: " + ", ".join(str(len(grouped[target])) for target in sorted(grouped)))
+    print("  samples per calibration point: " + ", ".join(str(len(grouped[target])) for target in target_order))
     if diagnostics.warnings:
         print("Warnings")
         for warning in diagnostics.warnings:
@@ -76,8 +83,8 @@ def main() -> None:
         print("Warnings: none")
     print("Runtime note")
     print(
-        "  If live raw_y falls below the calibrated raw_y minimum, affine mapping extrapolates above "
-        "the screen and screen clamping can force mapped Y to 0."
+        "  If live raw gaze falls outside the stable part of the calibrated model, the mapper can "
+        "extrapolate outside the screen and screen clamping can force the cursor to an edge."
     )
     print(
         "  VisiMove can clamp mapping input to the calibrated raw domain plus margin, but cursor "

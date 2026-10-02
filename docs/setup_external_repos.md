@@ -270,11 +270,13 @@ Dependency notes:
 
 - Keep training and PyTorch-heavy dependencies outside the desktop runtime by default.
 - Prefer ONNX exports for real-time VisiMove inference.
+- The VisiMove preview adapter only requires `onnxruntime`, `opencv-python`, and `numpy`.
 - Use cloud notebooks for training or fine-tuning work.
 
 Expected model weight locations:
 
 ```text
+external/mobilegaze/weights/mobileone_s0_gaze.onnx
 models/gaze/mobilegaze/*.onnx
 models/gaze/mobilegaze/*.pt
 ```
@@ -285,7 +287,19 @@ Config keys:
 gaze:
   gaze_backend: mobilegaze
   backend: mobilegaze
-  model_path: models/gaze/mobilegaze/mobilegaze.onnx
+
+mobilegaze:
+  repo_path: external/mobilegaze
+  model_path: external/mobilegaze/weights/mobileone_s0_gaze.onnx
+  yaw_range_deg: 45.0
+  pitch_range_deg: 35.0
+  face_crop_scale: 1.15
+```
+
+Preview command:
+
+```powershell
+python scripts/run_tracking.py --gaze-backend mobilegaze --show-debug
 ```
 
 ### OCEC

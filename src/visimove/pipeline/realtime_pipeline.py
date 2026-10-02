@@ -13,14 +13,14 @@ from visimove.calibration import CalibrationMapper, LiveTrackingQualityMonitor, 
 from visimove.calibration import MappingDebugInfo, load_calibration_profile
 from visimove.camera.base import CameraConfig
 from visimove.camera.webcam import WebcamCamera
-from visimove.cursor import CursorController, CursorSafety, CursorSafetyConfig
+from visimove.cursor import CursorController, CursorSafety, CursorSafetyConfig, DwellSelector, VelocityCursorFilter
 from visimove.cursor import DryRunCursorController, PyAutoGuiCursorController, Win32CursorController
 from visimove.detection import BaseDetector, DummyDetector, MediaPipeFaceMeshDetector, OpenCvHaarDetector
 from visimove.detection import YoloDetector
 from visimove.gaze import BaseGazeModel, EyeTraxAdapter, GazeBackendUnavailable
 from visimove.gaze import GazeFollowerAdapter, GazeResult, MobileGazeAdapter, MovingDummyGazeModel
 from visimove.pipeline.performance_monitor import PipelinePerformanceMonitor
-from visimove.smoothing import DeadzoneFilter, EmaFilter, FixationFilter, KalmanFilter2D
+from visimove.smoothing import AdaptiveSmoothingFilter, DeadzoneFilter, EmaFilter, FixationFilter, KalmanFilter2D, OneEuroFilter2D
 from visimove.types import DetectionResult, ScreenPoint
 from visimove.utils.screen import get_screen_bounds
 
@@ -40,6 +40,7 @@ class RealtimePipelineConfig:
     live_domain_violation_ratio_threshold: float = 0.30
     live_domain_window_size: int = 30
     axis_adjustment: AxisAdjustmentConfig = field(default_factory=AxisAdjustmentConfig)
+    cursor_control_mode: str = "absolute"
 
 
 class RealtimeVisiMovePipeline:
@@ -55,6 +56,7 @@ class RealtimeVisiMovePipeline:
         cursor: CursorController,
         performance: PipelinePerformanceMonitor,
         config: RealtimePipelineConfig,
+        dwell_selector: DwellSelector | None = None,
     ) -> None:
         self.camera = camera
         self.detector = detector
@@ -66,6 +68,7 @@ class RealtimeVisiMovePipeline:
         self.cursor = cursor
         self.performance = performance
         self.config = config
+        self.dwell_selector = dwell_selector
         self._last_debug_at = 0.0
         self.live_quality_monitor = LiveTrackingQualityMonitor(
             window_size=config.live_domain_window_size,
@@ -104,13 +107,26 @@ class RealtimeVisiMovePipeline:
                     )
                 with self.performance.stage("smoothing"):
                     adjusted_point = axis_adjustment.after
-                    smoothed_xy = self.smoother.update(adjusted_point.x, adjusted_point.y, now)
+                    control_point = (
+                        _velocity_control_point(gaze, self.mapper.screen_width, self.mapper.screen_height)
+                        if self.config.cursor_control_mode == "velocity"
+                        else adjusted_point
+                    )
+                    target_visible = detection.found and detection.eyes is not None
+                    smoothing_target_visible = self._smoothing_target_visible(
+                        gaze.confidence,
+                        target_visible,
+                        live_quality,
+                    )
+                    if smoothing_target_visible:
+                        smoothed_xy = self.smoother.update(control_point.x, control_point.y, now)
+                    else:
+                        smoothed_xy = self.smoother.update(None, None, now)
                     if smoothed_xy is None:
-                        smoothed = adjusted_point
+                        smoothed = control_point
                     else:
                         smoothed = ScreenPoint(round(smoothed_xy[0]), round(smoothed_xy[1]))
                 with self.performance.stage("cursor"):
-                    target_visible = detection.found and detection.eyes is not None
                     skip_reason = self._cursor_skip_reason(gaze.confidence, target_visible, live_quality)
                     cursor_target_visible = target_visible and skip_reason == "none"
                     self.cursor.move_to(
@@ -119,8 +135,14 @@ class RealtimeVisiMovePipeline:
                         gaze_confidence=gaze.confidence,
                         target_visible=cursor_target_visible,
                     )
-                    if cursor_target_visible:
-                        self._handle_click_event(click_event)
+                    click_name = self._handle_click_event(click_event) if cursor_target_visible else "none"
+                    dwell_allowed = cursor_target_visible and self._dwell_allowed()
+                    if dwell_allowed and click_name == "none" and self.dwell_selector is not None:
+                        if self.dwell_selector.update(smoothed, timestamp=now):
+                            self.cursor.left_click()
+                            click_name = "dwell_left_click"
+                    elif self.dwell_selector is not None:
+                        self.dwell_selector.reset()
 
                 self.performance.mark_frame()
                 if self.config.show_debug and now - self._last_debug_at >= self.config.debug_interval_seconds:
@@ -134,7 +156,7 @@ class RealtimeVisiMovePipeline:
                         mapping_debug=mapping_debug,
                         live_quality=live_quality,
                         smoothed=smoothed,
-                        click_event=click_event,
+                        click_name=click_name,
                         cursor_skip_reason=skip_reason,
                     )
                 if self.config.show_preview:
@@ -144,6 +166,8 @@ class RealtimeVisiMovePipeline:
                         self.blink_model.trigger()
                     if key == ord("p"):
                         self._toggle_cursor_pause()
+                    if key == ord("c"):
+                        self._recenter_velocity_control()
                     if key == ord("q"):
                         break
 
@@ -176,7 +200,7 @@ class RealtimeVisiMovePipeline:
             f"screen=({point.x},{point.y}) blink={blink.combined_closed_probability:.2f}"
         )
         cv2.putText(frame, status, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-        cv2.putText(frame, "q: quit | b: fake blink | p: pause/resume cursor", (12, 56),
+        cv2.putText(frame, "q: quit | b: fake blink | p: pause/resume", (12, 56),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.imshow("VisiMove Tracking", frame)
 
@@ -184,11 +208,33 @@ class RealtimeVisiMovePipeline:
         safety = getattr(self.cursor, "safety", None)
         if safety is not None and getattr(safety, "paused", True):
             self.cursor.resume()
+            set_position = getattr(self.smoother, "set_position", None)
+            if callable(set_position):
+                set_position(getattr(safety, "current_position", None))
+            begin_neutral_calibration = getattr(self.smoother, "begin_neutral_calibration", None)
+            if callable(begin_neutral_calibration):
+                begin_neutral_calibration()
+                print("Look at the screen center for one second to set neutral gaze.")
+            if self.dwell_selector is not None:
+                self.dwell_selector.reset()
             print("Cursor resumed.")
         else:
             self.cursor.pause()
             print("Cursor paused.")
 
+    def _recenter_velocity_control(self) -> None:
+        begin_neutral_calibration = getattr(self.smoother, "begin_neutral_calibration", None)
+        if not callable(begin_neutral_calibration):
+            return
+        begin_neutral_calibration()
+        if self.dwell_selector is not None:
+            self.dwell_selector.reset()
+        print("Velocity control recentering: look at the screen center for one second.")
+
+    def _dwell_allowed(self) -> bool:
+        if self.config.cursor_control_mode != "velocity":
+            return True
+        return _format_smoothing_state(self.smoother) == "velocity_hold"
     def _cursor_skip_reason(
         self,
         gaze_confidence: float,
@@ -208,10 +254,37 @@ class RealtimeVisiMovePipeline:
         if (
             self.config.block_cursor_when_outside_calibration_domain
             and not self.config.allow_unstable_live_gaze
-            and live_quality.quality in {"unstable", "unsafe"}
+            and live_quality.quality == "unsafe"
         ):
             return "live gaze outside calibrated domain"
         return "none"
+
+    def _smoothing_target_visible(
+        self,
+        gaze_confidence: float,
+        target_visible: bool,
+        live_quality: LiveTrackingQualityState,
+    ) -> bool:
+        if not target_visible:
+            return False
+        safety = getattr(self.cursor, "safety", None)
+        if (
+            self.config.cursor_control_mode == "velocity"
+            and self.config.cursor_enabled
+            and safety is not None
+            and getattr(safety, "paused", False)
+        ):
+            return False
+        min_confidence = getattr(getattr(safety, "config", None), "min_gaze_confidence", 0.0)
+        if gaze_confidence < min_confidence:
+            return False
+        if (
+            self.config.block_cursor_when_outside_calibration_domain
+            and not self.config.allow_unstable_live_gaze
+            and live_quality.quality == "unsafe"
+        ):
+            return False
+        return True
 
     def _print_debug(
         self,
@@ -223,10 +296,9 @@ class RealtimeVisiMovePipeline:
         mapping_debug: MappingDebugInfo,
         live_quality: LiveTrackingQualityState,
         smoothed: ScreenPoint,
-        click_event: ClickEvent | None,
+        click_name: str,
         cursor_skip_reason: str,
     ) -> None:
-        click_name = "none" if click_event is None else click_event.value
         gaze_backend = str(gaze.metadata.get("backend", "unknown"))
         gaze_reason = str(gaze.metadata.get("unavailable_reason", "none"))
         fallback = "yes" if gaze.metadata.get("fallback", False) else "no"
@@ -235,6 +307,7 @@ class RealtimeVisiMovePipeline:
             f"gaze_backend={gaze_backend} "
             f"fallback={fallback} "
             f"raw_gaze=({gaze.point.x:.3f},{gaze.point.y:.3f}) "
+            f"{_format_gaze_filter_debug(gaze.metadata)}"
             f"{_format_gaze_native_debug(gaze.metadata)}"
             f"calibration_raw_domain={_format_domain(mapping_debug)} "
             f"raw_domain_status={mapping_debug.raw_domain_status} "
@@ -242,8 +315,15 @@ class RealtimeVisiMovePipeline:
             f"mapped_input_after_domain_clamp=({mapping_debug.mapped_input_x:.3f},{mapping_debug.mapped_input_y:.3f}) "
             f"mapped_raw_before_screen_clamp=({mapping_debug.before_clamp_x:.1f},{mapping_debug.before_clamp_y:.1f}) "
             f"mapped_after_clamp=({mapped.x},{mapped.y}) "
+            f"edge_reach_after=({axis_adjustment.after_edge_reach.x},{axis_adjustment.after_edge_reach.y}) "
+            f"edge_reach_enabled={'yes' if axis_adjustment.edge_reach_enabled else 'no'} "
+            f"edge_margin_px={axis_adjustment.edge_margin_px} "
+            f"edge_boost={'yes' if axis_adjustment.edge_boost_enabled else 'no'} "
+            f"edge_boost_gamma={axis_adjustment.edge_boost_gamma:.2f} "
             f"adjusted_after_gain=({axis_adjustment.after.x},{axis_adjustment.after.y}) "
             f"smoothed=({smoothed.x},{smoothed.y}) "
+            f"smoothing_state={_format_smoothing_state(self.smoother)} "
+            f"cursor_mode={self.config.cursor_control_mode} "
             f"horizontal_gain={axis_adjustment.horizontal_gain:.2f} "
             f"vertical_gain={axis_adjustment.vertical_gain:.2f} "
             f"horizontal_offset={axis_adjustment.horizontal_offset:.1f} "
@@ -262,9 +342,9 @@ class RealtimeVisiMovePipeline:
         if self.config.calibration_warnings:
             print("DEBUG calibration_warnings=" + " | ".join(self.config.calibration_warnings[:3]))
 
-    def _handle_click_event(self, event: ClickEvent | None) -> None:
+    def _handle_click_event(self, event: ClickEvent | None) -> str:
         if event is None or event is ClickEvent.NONE:
-            return
+            return "none"
         if event is ClickEvent.LEFT_CLICK:
             self.cursor.left_click()
         elif event is ClickEvent.RIGHT_CLICK:
@@ -273,7 +353,17 @@ class RealtimeVisiMovePipeline:
             self.cursor.double_click()
         elif event is ClickEvent.PAUSE_TOGGLE:
             self._toggle_cursor_pause()
+        return event.value
 
+
+def _velocity_control_point(gaze: GazeResult, screen_width: int, screen_height: int) -> ScreenPoint:
+    """Scale continuous normalized gaze into direction space for relative control."""
+    raw_x = min(max(float(gaze.raw_x), 0.0), 1.0)
+    raw_y = min(max(float(gaze.raw_y), 0.0), 1.0)
+    return ScreenPoint(
+        round(raw_x * max(screen_width - 1, 0)),
+        round(raw_y * max(screen_height - 1, 0)),
+    )
 
 def build_realtime_pipeline(config: dict[str, Any]) -> RealtimeVisiMovePipeline:
     camera_config = CameraConfig(**config.get("camera", {}))
@@ -283,12 +373,16 @@ def build_realtime_pipeline(config: dict[str, Any]) -> RealtimeVisiMovePipeline:
     blink_config = config.get("blink", {})
     detection_config = config.get("detection", {})
     gaze_config = config.get("gaze", {})
-    smoothing_config = config.get("smoothing", {})
+    smoothing_config = dict(config.get("smoothing", {}))
     calibration_config = config.get("calibration", {})
 
     dry_run = bool(pipeline_config.get("dry_run", True)) or not bool(cursor_config.get("enabled", False))
+    screen_bounds = get_screen_bounds()
+    smoothing_config.setdefault("screen_width", screen_bounds.width)
+    smoothing_config.setdefault("screen_height", screen_bounds.height)
+
     safety = CursorSafety(
-        bounds=get_screen_bounds(),
+        bounds=screen_bounds,
         config=CursorSafetyConfig(
             min_gaze_confidence=float(cursor_config.get("min_gaze_confidence", 0.65)),
             max_speed_px_per_sec=float(cursor_config.get("max_speed_px_per_sec", 1400)),
@@ -309,6 +403,35 @@ def build_realtime_pipeline(config: dict[str, Any]) -> RealtimeVisiMovePipeline:
         cursor = PyAutoGuiCursorController(
             safety=safety,
             movement_duration_sec=float(cursor_config.get("movement_duration_sec", 0.03)),
+        )
+
+    cursor_control_mode = str(cursor_config.get("control_mode", "absolute")).lower()
+    if cursor_control_mode == "velocity":
+        smoother = VelocityCursorFilter(
+            screen_width=screen_bounds.width,
+            screen_height=screen_bounds.height,
+            initial_position=safety.current_position,
+            deadzone=float(cursor_config.get("velocity_deadzone", 0.20)),
+            horizontal_deadzone=float(cursor_config.get("velocity_horizontal_deadzone", 0.10)),
+            vertical_deadzone=float(cursor_config.get("velocity_vertical_deadzone", 0.06)),
+            max_speed_px_per_sec=float(cursor_config.get("velocity_max_speed_px_per_sec", 1400)),
+            response_exponent=float(cursor_config.get("velocity_response_exponent", 1.35)),
+            max_dt_seconds=float(cursor_config.get("velocity_max_dt_seconds", 0.10)),
+            edge_margin_px=int(cursor_config.get("velocity_edge_margin_px", 8)),
+            neutral_acquisition_seconds=float(cursor_config.get("velocity_neutral_acquisition_seconds", 1.0)),
+            neutral_min_samples=int(cursor_config.get("velocity_neutral_min_samples", 8)),
+            median_window=int(cursor_config.get("velocity_median_window", 5)),
+        )
+    elif cursor_control_mode == "absolute":
+        smoother = build_smoothing_filter(smoothing_config)
+    else:
+        raise ValueError(f"Unsupported cursor control mode: {cursor_control_mode}")
+
+    dwell_selector = None
+    if bool(cursor_config.get("dwell_enabled", False)):
+        dwell_selector = DwellSelector(
+            dwell_time_ms=int(cursor_config.get("dwell_time_ms", 900)),
+            radius_px=int(cursor_config.get("dwell_radius_px", 35)),
         )
 
     return RealtimeVisiMovePipeline(
@@ -333,7 +456,7 @@ def build_realtime_pipeline(config: dict[str, Any]) -> RealtimeVisiMovePipeline:
             )
         ),
         mapper=build_calibration_mapper(calibration_config),
-        smoother=build_smoothing_filter(smoothing_config),
+        smoother=smoother,
         cursor=cursor,
         performance=PipelinePerformanceMonitor(),
         config=RealtimePipelineConfig(
@@ -354,7 +477,9 @@ def build_realtime_pipeline(config: dict[str, Any]) -> RealtimeVisiMovePipeline:
             ),
             live_domain_window_size=int(calibration_config.get("live_domain_window_size", 30)),
             axis_adjustment=build_axis_adjustment_config(calibration_config),
+            cursor_control_mode=cursor_control_mode,
         ),
+        dwell_selector=dwell_selector,
     )
 
 
@@ -365,7 +490,24 @@ def build_axis_adjustment_config(config: dict[str, Any]) -> AxisAdjustmentConfig
         horizontal_offset=float(config.get("horizontal_offset", 0.0)),
         vertical_offset=float(config.get("vertical_offset", 0.0)),
         enabled=bool(config.get("center_bias_correction", True)),
+        edge_reach_enabled=bool(config.get("edge_reach_enabled", False)),
+        edge_margin_px=int(config.get("edge_margin_px", 0)),
+        edge_boost_enabled=bool(config.get("edge_boost_enabled", False)),
+        edge_boost_gamma=float(config.get("edge_boost_gamma", 0.80)),
+        source_min_x=_optional_float(config.get("edge_source_min_x")),
+        source_max_x=_optional_float(config.get("edge_source_max_x")),
+        source_min_y=_optional_float(config.get("edge_source_min_y")),
+        source_max_y=_optional_float(config.get("edge_source_max_y")),
     )
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def build_calibration_mapper(config: dict[str, Any]) -> CalibrationMapper:
@@ -381,6 +523,9 @@ def build_calibration_mapper(config: dict[str, Any]) -> CalibrationMapper:
         mapper = CalibrationMapper.from_profile(profile)
         mapper.clamp_raw_input_to_calibration_domain = bool(
             config.get("clamp_raw_input_to_calibration_domain", True)
+        )
+        mapper.clamp_raw_input_to_mapping_domain = bool(
+            config.get("clamp_raw_input_to_mapping_domain", True)
         )
         mapper.raw_domain_margin = float(config.get("raw_domain_margin", 0.05))
         return mapper
@@ -403,6 +548,19 @@ def _format_violations(violations: tuple[str, ...]) -> str:
     return "none" if not violations else ",".join(violations)
 
 
+def _format_gaze_filter_debug(metadata: dict[str, Any]) -> str:
+    unfiltered = metadata.get("unfiltered_raw_prediction")
+    if unfiltered is None:
+        return ""
+    try:
+        raw_x = float(unfiltered[0])
+        raw_y = float(unfiltered[1])
+        window = int(metadata.get("temporal_median_window", 1))
+    except (TypeError, ValueError, IndexError):
+        return ""
+    return f"unfiltered_raw_gaze=({raw_x:.3f},{raw_y:.3f}) raw_median_window={window} "
+
+
 def _format_gaze_native_debug(metadata: dict[str, Any]) -> str:
     native = metadata.get("native_prediction")
     if native is None:
@@ -421,7 +579,7 @@ def build_gaze_backend_config(config: dict[str, Any]) -> dict[str, Any]:
     backend = str(gaze_config.get("gaze_backend", gaze_config.get("backend", "dummy"))).lower()
     backend_config = dict(config.get(backend, {}))
     merged = {**backend_config, **gaze_config}
-    if backend in {"eyetrax", "gazefollower"}:
+    if backend in {"eyetrax", "gazefollower", "mobilegaze"}:
         model_path = gaze_config.get("model_path")
         if model_path in {None, "", "null"} and backend_config.get("model_path"):
             merged["model_path"] = backend_config["model_path"]
@@ -448,6 +606,32 @@ def build_smoothing_filter(config: dict[str, Any]) -> Any:
             fixation_radius=float(config.get("fixation_radius", 18)),
             max_jump_pixels=max_jump_pixels,
         )
+    if filter_name == "adaptive":
+        return AdaptiveSmoothingFilter(
+            fast_alpha=float(config.get("adaptive_fast_alpha", 0.38)),
+            slow_alpha=float(config.get("adaptive_slow_alpha", 0.025)),
+            fixation_radius=float(config.get("adaptive_fixation_radius", 90)),
+            release_radius=float(config.get("adaptive_release_radius", 220)),
+            fixation_hold_ms=int(config.get("adaptive_fixation_hold_ms", 180)),
+            max_jump_pixels=max_jump_pixels,
+            jump_confirm_radius=float(config.get("adaptive_jump_confirm_radius", 180)),
+            jump_confirm_samples=int(config.get("adaptive_jump_confirm_samples", 2)),
+            screen_width=_optional_float(config.get("screen_width")),
+            screen_height=_optional_float(config.get("screen_height")),
+            edge_snap_margin=float(config.get("adaptive_edge_snap_margin", 32)),
+            edge_fast_alpha=float(config.get("adaptive_edge_fast_alpha", 0.65)),
+        )
+    if filter_name in {"one_euro", "1euro"}:
+        return OneEuroFilter2D(
+            min_cutoff=float(config.get("one_euro_min_cutoff", 0.35)),
+            beta=float(config.get("one_euro_beta", 0.0001)),
+            derivative_cutoff=float(config.get("one_euro_derivative_cutoff", 1.0)),
+            max_dt_seconds=float(config.get("one_euro_max_dt_seconds", 0.20)),
+            max_speed_px_per_sec=float(config.get("one_euro_max_speed_px_per_sec", 1600)),
+            max_acceleration_px_per_sec2=float(
+                config.get("one_euro_max_acceleration_px_per_sec2", 5000)
+            ),
+        )
     if filter_name == "kalman":
         return KalmanFilter2D(
             process_noise=float(config.get("kalman_process_noise", 0.01)),
@@ -455,6 +639,13 @@ def build_smoothing_filter(config: dict[str, Any]) -> Any:
             max_jump_pixels=max_jump_pixels,
         )
     raise ValueError(f"Unsupported smoothing filter: {filter_name}")
+
+
+def _format_smoothing_state(smoother: Any) -> str:
+    debug_state = getattr(smoother, "debug_state", None)
+    if callable(debug_state):
+        return str(debug_state())
+    return "n/a"
 
 
 def build_detector(config: dict[str, Any]) -> BaseDetector:
@@ -581,11 +772,28 @@ def build_gaze_model(config: dict[str, Any]) -> BaseGazeModel:
                         "requested_backend": backend,
                         "unavailable_reason": str(exc),
                     }
+            )
+            raise
+
+    if backend == "mobilegaze":
+        try:
+            model = MobileGazeAdapter.from_config(config)
+            print("MobileGaze backend selected and preflight checks passed.")
+            return model
+        except (GazeBackendUnavailable, RuntimeError) as exc:
+            print(f"MobileGaze backend unavailable. {exc}")
+            if fallback_to_dummy:
+                print("Falling back to dummy gaze model.")
+                return MovingDummyGazeModel(
+                    metadata={
+                        "fallback": True,
+                        "requested_backend": backend,
+                        "unavailable_reason": str(exc),
+                    }
                 )
             raise
 
     adapter_map: dict[str, type[BaseGazeModel]] = {
-        "mobilegaze": MobileGazeAdapter,
     }
     adapter_class = adapter_map.get(backend)
     if adapter_class is None:

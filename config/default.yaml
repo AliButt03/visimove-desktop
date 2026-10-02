@@ -8,6 +8,9 @@ calibration:
   profile_path: data/calibration/user_profile.json
   mapping_model: affine
   mapping_model_type: affine
+  mapping_fit_strategy: point_means
+  mobilegaze_mapping_model: auto
+  mobilegaze_mapping_fit_strategy: point_means
   clamp_output: true
   stabilization_ms: 800
   collection_ms: 2500
@@ -16,6 +19,7 @@ calibration:
   sample_interval_ms: 0
   allow_acceptable_calibration_for_cursor: true
   clamp_raw_input_to_calibration_domain: true
+  clamp_raw_input_to_mapping_domain: false
   raw_domain_margin: 0.05
   block_cursor_when_outside_calibration_domain: true
   live_domain_violation_ratio_threshold: 0.30
@@ -26,6 +30,10 @@ calibration:
   vertical_offset: 0.0
   center_bias_correction: true
   allow_axis_gain_tuning: true
+  edge_reach_enabled: true
+  edge_margin_px: 8
+  edge_boost_enabled: false
+  edge_boost_gamma: 0.78
 
 detection:
   detector_backend: auto
@@ -61,6 +69,19 @@ gazefollower:
   face_model_path: external/gazefollower/gazefollower/res/model_weights/blaze_face.mnn
   face_alignment_backend: blazeface
   use_calibrated_output: false
+  native_output_mode: model_coordinates
+  native_coordinate_scale_x: 10.0
+  native_coordinate_scale_y: 10.0
+
+mobilegaze:
+  repo_path: external/mobilegaze
+  model_path: external/mobilegaze/weights/mobileone_s0_gaze.onnx
+  yaw_range_deg: 45.0
+  pitch_range_deg: 35.0
+  face_crop_scale: 1.15
+  temporal_median_window: 5
+  providers:
+    - CPUExecutionProvider
 
 blink:
   backend: dummy
@@ -81,25 +102,51 @@ blink:
 cursor:
   enabled: false
   backend: pyautogui
+  control_mode: absolute
+  velocity_deadzone: 0.20
+  velocity_horizontal_deadzone: 0.10
+  velocity_vertical_deadzone: 0.06
+  velocity_max_speed_px_per_sec: 1400
+  velocity_response_exponent: 1.35
+  velocity_max_dt_seconds: 0.10
+  velocity_edge_margin_px: 8
+  velocity_neutral_acquisition_seconds: 1.0
+  velocity_neutral_min_samples: 8
+  velocity_median_window: 5
   movement_gain: 1.0
-  movement_duration_sec: 0.03
-  max_speed_px_per_sec: 1400
+  movement_duration_sec: 0.0
+  max_speed_px_per_sec: 3000
   min_gaze_confidence: 0.65
   click_cooldown_ms: 500
   start_paused: true
   emergency_pause_key: p
   dwell_enabled: true
-  dwell_time_ms: 900
+  dwell_time_ms: 1200
   dwell_radius_px: 35
 
 smoothing:
-  filter: ema
+  filter: one_euro
   ema_alpha: 0.35
   alpha: 0.35
   deadzone_radius: 8
-  max_jump_pixels: 180
+  max_jump_pixels: 420
   fixation_duration_ms: 180
   fixation_radius: 18
+  adaptive_fast_alpha: 0.38
+  adaptive_slow_alpha: 0.025
+  adaptive_fixation_radius: 90
+  adaptive_release_radius: 220
+  adaptive_fixation_hold_ms: 180
+  adaptive_jump_confirm_radius: 180
+  adaptive_jump_confirm_samples: 2
+  adaptive_edge_snap_margin: 32
+  adaptive_edge_fast_alpha: 0.45
+  one_euro_min_cutoff: 0.35
+  one_euro_beta: 0.0001
+  one_euro_derivative_cutoff: 1.0
+  one_euro_max_dt_seconds: 0.20
+  one_euro_max_speed_px_per_sec: 1600
+  one_euro_max_acceleration_px_per_sec2: 5000
   kalman_process_noise: 0.01
   kalman_measurement_noise: 4.0
 

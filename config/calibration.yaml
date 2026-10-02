@@ -15,5 +15,8 @@ calibration:
   output_path: data/calibration/user_profile.json
   mapping_model: affine
   mapping_model_type: affine
+  mapping_fit_strategy: point_means
+  mobilegaze_mapping_model: auto
+  mobilegaze_mapping_fit_strategy: point_means
   ridge_alpha: 1.0
   polynomial_degree: 2

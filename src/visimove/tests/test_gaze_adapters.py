@@ -1,8 +1,9 @@
 import numpy as np
 
 from visimove.detection import DummyDetector
-from visimove.gaze import EyeTraxAdapter, GazeBackendUnavailable, GazeFollowerAdapter
+from visimove.gaze import EyeTraxAdapter, GazeBackendUnavailable, GazeFollowerAdapter, MobileGazeAdapter
 from visimove.gaze import GazeResult, MovingDummyGazeModel
+from visimove.gaze.mobilegaze_adapter import _RawGazeMedianFilter
 from visimove.pipeline.realtime_pipeline import build_gaze_backend_config, build_gaze_model
 
 
@@ -123,3 +124,104 @@ def test_gazefollower_backend_config_uses_backend_model_path_when_gaze_path_empt
     )
 
     assert config["model_path"] == "external/gazefollower/gazefollower/res/model_weights/base.mnn"
+
+
+def test_gazefollower_native_coordinates_are_not_treated_as_screen_pixels() -> None:
+    raw_x, raw_y, units = GazeFollowerAdapter._normalize_coordinates(0.367, -9.740)
+
+    assert units == "gazefollower_model_coordinates"
+    assert 0.5 < raw_x < 0.6
+    assert 0.0 < raw_y < 0.5
+
+
+def test_gazefollower_native_zero_maps_to_center() -> None:
+    raw_x, raw_y, units = GazeFollowerAdapter._normalize_coordinates(0.0, 0.0)
+
+    assert units == "gazefollower_model_coordinates"
+    assert raw_x == 0.5
+    assert raw_y == 0.5
+
+
+def test_gazefollower_native_coordinate_scale_is_configurable() -> None:
+    default_x, _default_y, _units = GazeFollowerAdapter._normalize_coordinates(5.0, 0.0, scale_x=10.0)
+    tighter_x, _tighter_y, _units = GazeFollowerAdapter._normalize_coordinates(5.0, 0.0, scale_x=2.0)
+
+    assert tighter_x > default_x
+
+
+def test_mobilegaze_missing_repo_reports_clear_message(tmp_path) -> None:
+    status = MobileGazeAdapter.check_setup(repo_path=tmp_path / "missing-mobilegaze")
+
+    assert not status.ready
+    assert "external/mobilegaze is not set up" in status.reason
+
+
+def test_mobilegaze_missing_model_does_not_claim_real_backend(tmp_path) -> None:
+    repo = tmp_path / "mobilegaze"
+    (repo / "models").mkdir(parents=True)
+    (repo / "utils").mkdir()
+    (repo / "onnx_inference.py").write_text("", encoding="utf-8")
+    (repo / "models" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "utils" / "helpers.py").write_text("", encoding="utf-8")
+
+    status = MobileGazeAdapter.check_setup(repo_path=repo, model_path=tmp_path / "missing.onnx")
+
+    assert not status.ready
+    assert "ONNX model file not found" in status.reason
+
+
+def test_mobilegaze_angles_map_to_center_and_edges() -> None:
+    center = MobileGazeAdapter._angles_to_raw(0.0, 0.0, yaw_range_deg=45.0, pitch_range_deg=35.0)
+    left = MobileGazeAdapter._angles_to_raw(np.radians(-45.0), 0.0, yaw_range_deg=45.0)
+    right = MobileGazeAdapter._angles_to_raw(np.radians(45.0), 0.0, yaw_range_deg=45.0)
+    top = MobileGazeAdapter._angles_to_raw(0.0, np.radians(35.0), pitch_range_deg=35.0)
+    bottom = MobileGazeAdapter._angles_to_raw(0.0, np.radians(-35.0), pitch_range_deg=35.0)
+
+    assert center == (0.5, 0.5)
+    assert left[0] == 0.0
+    assert right[0] == 1.0
+    assert top[1] == 0.0
+    assert bottom[1] == 1.0
+
+
+def test_mobilegaze_raw_median_filter_rejects_single_frame_outlier() -> None:
+    gaze_filter = _RawGazeMedianFilter(window_size=5)
+
+    for sample in ((0.50, 0.50), (0.51, 0.49), (0.95, 0.05), (0.49, 0.51)):
+        filtered = gaze_filter.update(*sample)
+
+    assert filtered == (0.505, 0.495)
+    assert gaze_filter.sample_count == 4
+
+
+def test_mobilegaze_raw_median_filter_resets_after_missing_detection() -> None:
+    gaze_filter = _RawGazeMedianFilter(window_size=4)
+    gaze_filter.update(0.20, 0.80)
+    gaze_filter.update(0.25, 0.75)
+
+    gaze_filter.reset()
+
+    assert gaze_filter.window_size == 5
+    assert gaze_filter.update(0.70, 0.30) == (0.70, 0.30)
+    assert gaze_filter.sample_count == 1
+
+
+def test_mobilegaze_backend_config_uses_backend_model_path_when_gaze_path_empty() -> None:
+    config = build_gaze_backend_config(
+        {
+            "gaze": {"gaze_backend": "mobilegaze", "backend": "mobilegaze", "model_path": None},
+            "mobilegaze": {
+                "model_path": "external/mobilegaze/weights/mobileone_s0_gaze.onnx",
+            },
+        }
+    )
+
+    assert config["model_path"] == "external/mobilegaze/weights/mobileone_s0_gaze.onnx"
+
+
+def test_legacy_gaze_adapters_module_reexports_real_adapters() -> None:
+    from visimove.gaze import adapters as gaze_adapters
+
+    assert gaze_adapters.EyeTraxAdapter is EyeTraxAdapter
+    assert gaze_adapters.GazeFollowerAdapter is GazeFollowerAdapter
+    assert gaze_adapters.MobileGazeAdapter is MobileGazeAdapter

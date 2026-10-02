@@ -154,10 +154,10 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> Non
     calibration_config = config.setdefault("calibration", {})
     if args.calibration_profile:
         calibration_config["profile_path"] = str(resolve_project_path(args.calibration_profile))
-    elif gaze_backend == "eyetrax":
-        eyetrax_profile = PROJECT_ROOT / "data" / "calibration" / "user_profile_eyetrax.json"
-        if eyetrax_profile.exists():
-            calibration_config["profile_path"] = str(eyetrax_profile)
+    elif gaze_backend in {"eyetrax", "mobilegaze"}:
+        backend_profile = PROJECT_ROOT / "data" / "calibration" / f"user_profile_{gaze_backend}.json"
+        if backend_profile.exists():
+            calibration_config["profile_path"] = str(backend_profile)
 
     if calibration_config.get("profile_path"):
         calibration_config["profile_path"] = str(resolve_project_path(calibration_config["profile_path"]))

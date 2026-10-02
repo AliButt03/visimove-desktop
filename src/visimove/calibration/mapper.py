@@ -61,7 +61,9 @@ class CalibrationMapper:
     screen_height: int = 1080
     mapping_model: RegressionMappingModel | None = None
     raw_domain: RawCalibrationDomain | None = None
+    mapping_input_domain: RawCalibrationDomain | None = None
     clamp_raw_input_to_calibration_domain: bool = False
+    clamp_raw_input_to_mapping_domain: bool = True
     raw_domain_margin: float = 0.05
 
     def map_to_screen(self, gaze: GazeEstimate) -> ScreenPoint:
@@ -138,6 +140,17 @@ class CalibrationMapper:
                 self.raw_domain.raw_y_min,
                 self.raw_domain.raw_y_max,
             )
+        if self.clamp_raw_input_to_mapping_domain and self.mapping_input_domain is not None:
+            mapped_x = _clamp(
+                mapped_x,
+                self.mapping_input_domain.raw_x_min,
+                self.mapping_input_domain.raw_x_max,
+            )
+            mapped_y = _clamp(
+                mapped_y,
+                self.mapping_input_domain.raw_y_min,
+                self.mapping_input_domain.raw_y_max,
+            )
         return RawDomainCheck(
             status="outside" if violations else "inside",
             violations=tuple(violations),
@@ -159,13 +172,54 @@ class CalibrationMapper:
                 raw_y_min=float(profile.raw_y_min),
                 raw_y_max=float(profile.raw_y_max),
             )
+        mapping_input_domain = _mapping_input_domain_from_profile(profile, mapping_model)
         return cls(
             screen_width=profile.screen_width,
             screen_height=profile.screen_height,
             mapping_model=mapping_model,
             raw_domain=raw_domain,
+            mapping_input_domain=mapping_input_domain,
         )
 
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
+
+
+def _mapping_input_domain_from_profile(
+    profile: CalibrationProfile,
+    mapping_model: RegressionMappingModel,
+) -> RawCalibrationDomain | None:
+    if mapping_model.input_min is not None and mapping_model.input_max is not None:
+        return RawCalibrationDomain(
+            raw_x_min=float(mapping_model.input_min[0]),
+            raw_x_max=float(mapping_model.input_max[0]),
+            raw_y_min=float(mapping_model.input_min[1]),
+            raw_y_max=float(mapping_model.input_max[1]),
+        )
+    if (
+        profile.mapping_parameters.get("model_type") != "affine"
+        or mapping_model.coefficients is None
+        or not profile.target_screen_coordinates
+    ):
+        return None
+
+    coefficients = mapping_model.coefficients
+    scale_x = float(coefficients[1, 0])
+    scale_y = float(coefficients[2, 1])
+    if abs(scale_x) < 1e-9 or abs(scale_y) < 1e-9:
+        return None
+    target_x_values = [float(target[0]) for target in profile.target_screen_coordinates]
+    target_y_values = [float(target[1]) for target in profile.target_screen_coordinates]
+    intercept_x = float(coefficients[0, 0])
+    intercept_y = float(coefficients[0, 1])
+    raw_x_a = (min(target_x_values) - intercept_x) / scale_x
+    raw_x_b = (max(target_x_values) - intercept_x) / scale_x
+    raw_y_a = (min(target_y_values) - intercept_y) / scale_y
+    raw_y_b = (max(target_y_values) - intercept_y) / scale_y
+    return RawCalibrationDomain(
+        raw_x_min=min(raw_x_a, raw_x_b),
+        raw_x_max=max(raw_x_a, raw_x_b),
+        raw_y_min=min(raw_y_a, raw_y_b),
+        raw_y_max=max(raw_y_a, raw_y_b),
+    )

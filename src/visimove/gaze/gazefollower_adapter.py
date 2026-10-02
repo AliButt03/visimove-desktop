@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import util
+import math
 from pathlib import Path
 import sys
 from time import perf_counter
@@ -15,7 +16,6 @@ from visimove.external_backends import ExternalBackendUnavailable, require_exter
 from visimove.gaze.base_gaze_model import GazeBackendUnavailable
 from visimove.gaze.gaze_output import GazeResult
 from visimove.types import Frame
-from visimove.utils.screen import get_screen_bounds
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,9 @@ class GazeFollowerAdapterConfig:
     face_model_path: Path | None = None
     face_alignment_backend: str = "blazeface"
     use_calibrated_output: bool = False
+    native_output_mode: str = "model_coordinates"
+    native_coordinate_scale_x: float = 10.0
+    native_coordinate_scale_y: float = 10.0
 
 
 class GazeFollowerAdapter:
@@ -55,6 +58,9 @@ class GazeFollowerAdapter:
         face_model_path: str | Path | None = None,
         face_alignment_backend: str = "blazeface",
         use_calibrated_output: bool = False,
+        native_output_mode: str = "model_coordinates",
+        native_coordinate_scale_x: float = 10.0,
+        native_coordinate_scale_y: float = 10.0,
     ) -> None:
         self.config = GazeFollowerAdapterConfig(
             repo_path=_resolve_path(repo_path or PROJECT_ROOT / "external" / "gazefollower"),
@@ -62,6 +68,9 @@ class GazeFollowerAdapter:
             face_model_path=_resolve_optional_path(face_model_path),
             face_alignment_backend=face_alignment_backend.lower(),
             use_calibrated_output=use_calibrated_output,
+            native_output_mode=native_output_mode,
+            native_coordinate_scale_x=max(float(native_coordinate_scale_x), 1e-6),
+            native_coordinate_scale_y=max(float(native_coordinate_scale_y), 1e-6),
         )
         status = self.check_setup(
             repo_path=self.config.repo_path,
@@ -87,6 +96,9 @@ class GazeFollowerAdapter:
             face_model_path=config.get("face_model_path"),
             face_alignment_backend=str(config.get("face_alignment_backend", "blazeface")),
             use_calibrated_output=bool(config.get("use_calibrated_output", False)),
+            native_output_mode=str(config.get("native_output_mode", "model_coordinates")),
+            native_coordinate_scale_x=float(config.get("native_coordinate_scale_x", 10.0)),
+            native_coordinate_scale_y=float(config.get("native_coordinate_scale_y", 10.0)),
         )
 
     @classmethod
@@ -209,7 +221,13 @@ class GazeFollowerAdapter:
         if native.size < 2 or not np.isfinite(native[:2]).all():
             return self._empty_result(started, "GazeFollower returned invalid raw coordinates")
 
-        raw_x, raw_y, units = self._normalize_coordinates(float(native[0]), float(native[1]))
+        raw_x, raw_y, units = self._normalize_coordinates(
+            float(native[0]),
+            float(native[1]),
+            scale_x=self.config.native_coordinate_scale_x,
+            scale_y=self.config.native_coordinate_scale_y,
+        )
+        features = np.asarray(getattr(gaze_info, "features", []), dtype=float).reshape(-1)
         metadata = {
             "backend": self.backend_name,
             "fallback": False,
@@ -219,6 +237,12 @@ class GazeFollowerAdapter:
             "face_alignment_backend": self.config.face_alignment_backend,
             "native_prediction": (float(native[0]), float(native[1])),
             "native_prediction_units": units,
+            "normalization_method": "centered_tanh",
+            "normalization_scale": (
+                self.config.native_coordinate_scale_x,
+                self.config.native_coordinate_scale_y,
+            ),
+            "feature_vector_size": int(features.size),
             "tracking_state": getattr(getattr(gaze_info, "tracking_state", None), "name", "unknown"),
             "left_openness": float(getattr(gaze_info, "left_openness", 0.0)),
             "right_openness": float(getattr(gaze_info, "right_openness", 0.0)),
@@ -344,14 +368,25 @@ class GazeFollowerAdapter:
         )
 
     @staticmethod
-    def _normalize_coordinates(x: float, y: float) -> tuple[float, float, str]:
-        if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
-            return x, y, "normalized_0_1"
-        if -1.0 <= x <= 1.0 and -1.0 <= y <= 1.0:
-            return _clamp01((x + 1.0) / 2.0), _clamp01((y + 1.0) / 2.0), "normalized_minus1_1"
+    def _normalize_coordinates(
+        x: float,
+        y: float,
+        *,
+        scale_x: float = 10.0,
+        scale_y: float = 10.0,
+    ) -> tuple[float, float, str]:
+        """Map GazeFollower's uncalibrated model output into VisiMove's 0..1 raw space.
 
-        screen = get_screen_bounds()
-        return _clamp01(x / screen.width), _clamp01(y / screen.height), "screen_pixels"
+        In the upstream GazeFollower code, `raw_gaze_coordinates` is `res[:2]`
+        from the MNN model output. GazeFollower's own screen output is produced
+        later by SVR calibration over the full feature vector, so these native
+        coordinates must not be treated as Windows screen pixels.
+        """
+        safe_scale_x = max(float(scale_x), 1e-6)
+        safe_scale_y = max(float(scale_y), 1e-6)
+        raw_x = 0.5 + 0.5 * math.tanh(float(x) / safe_scale_x)
+        raw_y = 0.5 + 0.5 * math.tanh(float(y) / safe_scale_y)
+        return _clamp01(raw_x), _clamp01(raw_y), "gazefollower_model_coordinates"
 
 
 def _resolve_path(path: str | Path) -> Path:

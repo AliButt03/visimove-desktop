@@ -173,7 +173,7 @@ To diagnose a saved profile:
 python scripts/diagnose_calibration_mapping.py --profile data/calibration/user_profile_eyetrax.json
 ```
 
-The diagnostic prints raw ranges, target ranges, per-point mapped predictions before and after clamping, prediction errors, RMSE, clipping ratio, negative-Y ratio, and whether mapped Y is stuck at the top edge.
+The diagnostic prints raw ranges, target ranges, per-point mapped predictions before and after clamping, prediction errors, RMSE, clipping ratio, negative-Y ratio, raw-sample mapping error, raw-sample clipping ratio, and whether mapped Y is stuck at the top edge. The raw-sample metrics matter because a model can fit the nine averaged calibration dots while still sending noisy live samples far outside the screen.
 
 To diagnose live left/right bias after a good calibration:
 
@@ -290,3 +290,190 @@ python scripts/run_tracking.py --gaze-backend gazefollower --show-debug
 ```
 
 If the startup summary reports missing `MNN` or `pygame`, install them in the selected virtual environment before expecting real GazeFollower output. Until GazeFollower produces real preview output and a backend-specific VisiMove calibration is created, cursor movement must remain disabled.
+
+Current GazeFollower preview status:
+
+```text
+gaze_backend=gazefollower
+fallback=no
+face_found=yes
+native_gaze=(0.367,-9.740)
+raw_gaze=(0.000,0.000)
+gaze_conf=0.80
+```
+
+The external code confirms that `raw_gaze_coordinates` is `res[:2]` from the MNN model output. GazeFollower's own screen coordinate path uses SVR calibration over the full `features` vector, then converts the calibrated prediction to pixels. That means the native values are uncalibrated model coordinates, not Windows screen pixels.
+
+VisiMove now labels the native units as `gazefollower_model_coordinates` and maps them into 0..1 preview space with a centered `tanh` transform:
+
+```yaml
+gazefollower:
+  native_output_mode: model_coordinates
+  native_coordinate_scale_x: 10.0
+  native_coordinate_scale_y: 10.0
+```
+
+This prevents small/negative native values from being incorrectly divided by the screen size and pinned to `(0,0)`. It does not make GazeFollower safe for cursor control by itself. Use preview first and only create a GazeFollower calibration profile if `raw_gaze` changes meaningfully as you look left/right/up/down.
+
+## MobileGaze Calibration Readiness
+
+MobileGaze is now wired for preview through ONNX Runtime. It uses VisiMove's detected face box as the model input crop and expects:
+
+```text
+external/mobilegaze/weights/mobileone_s0_gaze.onnx
+```
+
+MobileGaze outputs gaze angles:
+
+- `yaw`: horizontal gaze angle in radians
+- `pitch`: vertical gaze angle in radians
+
+These are not screen coordinates. The adapter maps yaw/pitch into normalized raw gaze using configured angle ranges before VisiMove screen calibration:
+
+```yaml
+mobilegaze:
+  yaw_range_deg: 45.0
+  pitch_range_deg: 35.0
+```
+
+Live preview showed MobileGaze had useful directional separation, but the first adapter pass mapped the horizontal axis backwards: left gaze produced a larger `raw_x` than right gaze. The adapter now uses MobileGaze's yaw sign so left maps toward `raw_x=0`, center toward `0.5`, and right toward `raw_x=1`.
+
+Recommended safe workflow:
+
+```powershell
+python scripts/run_tracking.py --gaze-backend mobilegaze --show-debug
+python scripts/diagnose_live_gaze.py --gaze-backend mobilegaze --guided
+python scripts/run_calibration.py --gaze-backend mobilegaze --verbose-quality
+python scripts/run_tracking.py --gaze-backend mobilegaze --show-debug
+```
+
+MobileGaze calibration saves to `data/calibration/user_profile_mobilegaze.json` by default. Do not enable cursor until that matching MobileGaze calibration profile has acceptable or good quality and live tracking is stable.
+
+MobileGaze uses backend-specific mapping defaults:
+
+```yaml
+calibration:
+  mobilegaze_mapping_model: auto
+  mobilegaze_mapping_fit_strategy: point_means
+```
+
+`auto` trains candidate mapping models and saves the one with the best stability score. It now includes bounded `grid` and `idw` point-mean interpolation models before polynomial, linear, and affine candidates. The score still uses calibration point means, but it also penalizes candidates whose individual raw calibration samples map outside the screen. This is important because MobileGaze yaw/pitch samples are noisy: polynomial, linear, or affine fits can look good on the nine averaged dots but still produce huge off-screen predictions between those means.
+
+`grid` maps the calibrated left/center/right columns and top/middle/bottom rows independently. This is useful for MobileGaze because it can reach the calibrated row/column edges when live yaw/pitch moves beyond the point means, while remaining bounded by the calibration target rectangle.
+
+Current MobileGaze status:
+
+- A MobileGaze profile exists, but the current saved profile should be treated as `needs_review` until it is recalibrated with the bounded `idw` auto candidate.
+- The latest saved affine profile still maps about `36%` of raw calibration samples outside the screen, with raw-sample mean absolute error around `549px` X and `250px` Y.
+- A dry-run of the new bounded `idw` model on the current calibration samples keeps raw-sample clipped prediction ratio at `0%`, but raw-sample error is still high. Recalibrate and preview before any cursor-enabled run.
+- After IDW cursor testing, a dry-run of the new `grid` candidate on the same samples reduced raw-sample MAE to about `262px` X and `121px` Y, still with `0%` raw-sample clipping. Recalibrate again so `auto` can save `grid` if it remains the best candidate.
+- Startup now recomputes mapping diagnostics and downgrades unstable profiles to `needs_review` even if the saved JSON says `good`.
+- The live guided diagnostic previously loaded the wrong default calibration profile; rerun it after the profile-selection fix before making cursor decisions.
+- Corrected guided diagnostics show useful directional separation: left/center/right mapped X means around `88/1146/2373`, and top/bottom mapped Y means around `149/1215`.
+- Runtime mapping input-domain clamping is disabled by default for MobileGaze noise, while raw calibration-domain clamping remains enabled.
+
+Safe next flow:
+
+```powershell
+python scripts\diagnose_calibration_mapping.py --profile data\calibration\user_profile_mobilegaze.json
+python scripts\run_calibration.py --gaze-backend mobilegaze --verbose-quality
+python scripts\diagnose_calibration_mapping.py --profile data\calibration\user_profile_mobilegaze.json
+python scripts\diagnose_live_gaze.py --gaze-backend mobilegaze --guided
+python scripts\run_tracking.py --gaze-backend mobilegaze --show-debug --no-edge-reach --no-edge-boost --vertical-offset 0
+```
+
+Ignore older guided diagnostic output if every target reported mapped values stuck around `(1283,721)`. That indicated the diagnostic was using the old default profile, not `user_profile_mobilegaze.json`. Do not run the cursor command while calibration diagnostics warn about high point-mean error or raw-sample instability, while corrected debug output frequently shows `mapped_after_clamp` at `x=0`, `x=2559`, or `y=1439`, or while `live_tracking_quality=unsafe`. If final preview is mostly stable, the cursor can be tested carefully with:
+
+```powershell
+python scripts\run_tracking.py --gaze-backend mobilegaze --enable-cursor
+```
+
+If cursor movement is blocked only by occasional `live_tracking_quality=unstable`, use `--allow-unstable-live-gaze` only for a short controlled test with `p` and `Ctrl+C` ready.
+
+If the cursor still does not visibly move, rerun with debug:
+
+```powershell
+python scripts\run_tracking.py --gaze-backend mobilegaze --enable-cursor --allow-unstable-live-gaze --show-debug
+```
+
+Press `p` once to resume and inspect `cursor_skip`. If `cursor_skip=none` but the pointer still does not move, test the cursor backend directly:
+
+```powershell
+python scripts\test_cursor_backend.py --backend pyautogui
+python scripts\test_cursor_backend.py --backend win32
+```
+
+If Win32 works better on Windows, run tracking with:
+
+```powershell
+python scripts\run_tracking.py --gaze-backend mobilegaze --enable-cursor --allow-unstable-live-gaze --show-debug --cursor-backend win32
+```
+
+If the cursor follows gaze but jumps too much, tune smoothing before recalibrating. Start with a lower EMA alpha and lower cursor speed:
+
+```powershell
+python scripts\run_tracking.py --gaze-backend mobilegaze --enable-cursor --allow-unstable-live-gaze --show-debug --cursor-backend win32 --smoothing-filter ema --ema-alpha 0.18 --max-speed-px-per-sec 700
+```
+
+Lower `--ema-alpha` values reduce jitter but add lag. Lower `--max-speed-px-per-sec` values reduce jumps but make the pointer slower. Do not tune for clicks until the cursor movement is stable enough for preview.
+
+## Safe Edge Reach
+
+VisiMove calibration points are intentionally inset from the physical screen edges. On a `2560x1440` display, a 9-point profile may learn a target area such as `x[307,2252], y[173,1266]`. That protects calibration quality, but it can make the cursor feel like it hits an invisible boundary before the extreme left, right, top, or bottom.
+
+Safe edge-reach mode keeps the raw gaze and mapping input clamps in place, then expands the calibrated target rectangle to the full screen after mapping. This is safer than letting the mapper extrapolate raw gaze outside the calibrated domain.
+
+Default config:
+
+```yaml
+calibration:
+  edge_reach_enabled: false
+  edge_margin_px: 0
+```
+
+Recommended MobileGaze baseline test:
+
+```powershell
+python scripts\run_tracking.py --gaze-backend mobilegaze --show-debug --no-edge-reach --no-edge-boost --vertical-offset 0
+```
+
+Use `--edge-reach --edge-margin-px 0` only after the baseline is stable and the cursor clearly needs more reach toward taskbar/corner controls. Use `--edge-margin-px 20` if hitting screen corners triggers PyAutoGUI failsafe or feels too aggressive.
+
+## Adaptive Stabilization
+
+Fixed smoothing can make the cursor feel worse: a very low EMA alpha reduces shake, but it also creates lag and can leave the pointer far from the intended target. Adaptive stabilization uses a faster response for clear intentional movement and holds/slowly filters small fixation jitter.
+
+Recommended MobileGaze command:
+
+```powershell
+python scripts\run_tracking.py --gaze-backend mobilegaze --enable-cursor --allow-unstable-live-gaze --show-debug --cursor-backend win32 --smoothing-filter adaptive --max-speed-px-per-sec 850 --no-edge-reach --no-edge-boost --vertical-offset 0
+```
+
+Watch `smoothing_state` in debug output:
+
+- `moving`: the cursor is responding to a clear gaze move.
+- `slow`: movement is being damped.
+- `settling`: the cursor is close to fixation but not held yet.
+- `hold`: fixation jitter is being suppressed.
+
+If debug shows `adjusted_after_gain` close to the desired target but `smoothed` far away, the issue is smoothing lag rather than calibration. The adaptive filter now releases into `moving` when the smoothed cursor is far from the current mapped target, even if the fixation anchor is already near that target. For live testing, prefer a faster release before adding more gain or offset:
+
+```powershell
+python scripts\run_tracking.py --gaze-backend mobilegaze --enable-cursor --allow-unstable-live-gaze --show-debug --cursor-backend win32 --smoothing-filter adaptive --max-speed-px-per-sec 850 --no-edge-reach --no-edge-boost --vertical-offset 0
+```
+
+When the target is far from the cursor, `smoothing_state` should switch to `moving`. When your eyes are still, it should settle toward `hold` instead of continuously wandering.
+
+## Edge Boost
+
+If the cursor only reaches the screen edges when you look outside the screen, enable edge boost. Edge boost is applied after safe mapping/edge reach and makes near-edge gaze move farther toward the actual screen boundary without changing the raw gaze model.
+
+Recommended command:
+
+```powershell
+python scripts\run_tracking.py --gaze-backend mobilegaze --enable-cursor --allow-unstable-live-gaze --show-debug --cursor-backend win32 --smoothing-filter adaptive --adaptive-fast-alpha 0.34 --adaptive-slow-alpha 0.06 --adaptive-fixation-radius 42 --adaptive-release-radius 110 --adaptive-hold-ms 90 --max-speed-px-per-sec 850 --edge-reach --edge-margin-px 0 --edge-boost --edge-boost-gamma 0.78
+```
+
+Lower gamma means stronger edge boost. Try `0.82` if it becomes too aggressive, or `0.72` if top-right/taskbar controls still require looking outside the screen.
+
+Natural blink detection is not available yet; the dummy blink backend only supports controlled fake blink testing from the preview loop.

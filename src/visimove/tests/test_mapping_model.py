@@ -52,3 +52,99 @@ def test_affine_mapping_predicts_varied_y_for_varied_raw_y() -> None:
     assert round(top.y) == 100
     assert round(bottom.y) == 900
     assert bottom.y > top.y
+
+
+def test_idw_mapping_is_bounded_by_control_targets() -> None:
+    model = create_mapping_model("idw")
+    model.fit(
+        raw_gaze=[(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8)],
+        targets=[(100.0, 100.0), (900.0, 100.0), (100.0, 900.0), (900.0, 900.0)],
+    )
+
+    exact = model.predict((0.2, 0.2))
+    prediction = model.predict((-10.0, 10.0))
+
+    assert round(exact.x) == 100
+    assert round(exact.y) == 100
+    assert 100 <= prediction.x <= 900
+    assert 100 <= prediction.y <= 900
+
+
+def test_idw_mapping_serializes_control_points() -> None:
+    model = create_mapping_model(MappingModelType.IDW)
+    model.fit(
+        raw_gaze=[(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8)],
+        targets=[(100.0, 100.0), (900.0, 100.0), (100.0, 900.0), (900.0, 900.0)],
+    )
+
+    restored = RegressionMappingModel.from_parameters(model.to_parameters())
+    prediction = restored.predict((0.8, 0.8))
+
+    assert restored.model_type == MappingModelType.IDW
+    assert round(prediction.x) == 900
+    assert round(prediction.y) == 900
+
+
+def test_grid_mapping_interpolates_columns_and_rows() -> None:
+    model = create_mapping_model("grid")
+    raw = [
+        (0.2, 0.3),
+        (0.5, 0.3),
+        (0.8, 0.3),
+        (0.2, 0.6),
+        (0.5, 0.6),
+        (0.8, 0.6),
+        (0.2, 0.9),
+        (0.5, 0.9),
+        (0.8, 0.9),
+    ]
+    targets = [
+        (100.0, 100.0),
+        (500.0, 100.0),
+        (900.0, 100.0),
+        (100.0, 500.0),
+        (500.0, 500.0),
+        (900.0, 500.0),
+        (100.0, 900.0),
+        (500.0, 900.0),
+        (900.0, 900.0),
+    ]
+
+    model.fit(raw, targets)
+
+    center = model.predict((0.5, 0.6))
+    beyond_bottom_right = model.predict((1.0, 1.0))
+
+    assert round(center.x) == 500
+    assert round(center.y) == 500
+    assert round(beyond_bottom_right.x) == 900
+    assert round(beyond_bottom_right.y) == 900
+
+
+def test_grid_mapping_serializes_knots() -> None:
+    model = create_mapping_model(MappingModelType.GRID)
+    model.fit(
+        raw_gaze=[
+            (0.2, 0.3),
+            (0.5, 0.3),
+            (0.8, 0.3),
+            (0.2, 0.9),
+            (0.5, 0.9),
+            (0.8, 0.9),
+        ],
+        targets=[
+            (100.0, 100.0),
+            (500.0, 100.0),
+            (900.0, 100.0),
+            (100.0, 900.0),
+            (500.0, 900.0),
+            (900.0, 900.0),
+        ],
+    )
+
+    restored = RegressionMappingModel.from_parameters(model.to_parameters())
+    prediction = restored.predict((0.8, 0.9))
+
+    assert restored.model_type == MappingModelType.GRID
+    assert round(prediction.x) == 900
+    assert round(prediction.y) == 900

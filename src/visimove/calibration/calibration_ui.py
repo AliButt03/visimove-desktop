@@ -24,6 +24,7 @@ class CalibrationUiConfig:
     camera_index: int = 0
     output_path: str = "data/calibration/user_profile.json"
     mapping_model_type: str = "ridge"
+    mapping_fit_strategy: str = "point_means"
     stabilization_seconds: float = 0.75
     sample_seconds: float = 1.7
     stabilization_ms: int = 800
@@ -37,6 +38,12 @@ class CalibrationUiConfig:
     backend_metadata: dict[str, str] | None = None
     min_confidence: float = 0.5
     verbose_quality: bool = False
+
+
+@dataclass(frozen=True)
+class _FittedMapping:
+    model_type: str
+    parameters: dict[str, object]
 
 
 class CalibrationGazeProvider(Protocol):
@@ -168,16 +175,19 @@ class CalibrationUi:
         if self._finished:
             return
         self._finished = True
-        model = create_mapping_model(self.config.mapping_model_type)
-        raw, targets = calibration_point_means(self.samples)
+        raw, targets = self._mapping_training_data()
         mapping_parameters: dict[str, object] = {}
         mapping_success = False
+        selected_mapping_model_type = self.config.mapping_model_type
         try:
-            model.fit(raw, targets)
-            mapping_parameters = model.to_parameters()
+            fitted_mapping = self._fit_mapping(raw, targets)
+            selected_mapping_model_type = fitted_mapping.model_type
+            mapping_parameters = fitted_mapping.parameters
             mapping_success = True
         except (ValueError, RuntimeError) as exc:
             print(f"Calibration warning: mapping model training failed. {exc}")
+        if mapping_success and self.config.mapping_model_type == "auto":
+            print(f"Calibration selected mapping model: {selected_mapping_model_type}")
 
         mapping_diagnostics = {}
         if mapping_success:
@@ -187,7 +197,7 @@ class CalibrationUi:
                 camera_index=self.config.camera_index,
                 calibration_points=self.points,
                 samples=self.samples,
-                mapping_model_type=self.config.mapping_model_type,
+                mapping_model_type=selected_mapping_model_type,
                 mapping_parameters=mapping_parameters,
                 gaze_backend=self.config.gaze_backend,
                 detector_backend=self.config.detector_backend,
@@ -209,7 +219,7 @@ class CalibrationUi:
             camera_index=self.config.camera_index,
             calibration_points=self.points,
             samples=self.samples,
-            mapping_model_type=self.config.mapping_model_type,
+            mapping_model_type=selected_mapping_model_type,
             mapping_parameters=mapping_parameters,
             gaze_backend=self.config.gaze_backend,
             detector_backend=self.config.detector_backend,
@@ -337,6 +347,90 @@ class CalibrationUi:
             f"confidence_mean={_fmt(_mean_or_none(confidence_values))} "
             f"status={status}"
         )
+
+    def _mapping_training_data(self) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        if self.config.mapping_fit_strategy == "all_samples":
+            return (
+                [sample.raw_gaze for sample in self.samples],
+                [(float(sample.target_screen[0]), float(sample.target_screen[1])) for sample in self.samples],
+            )
+        return calibration_point_means(self.samples)
+
+    def _fit_mapping(
+        self,
+        raw: list[tuple[float, float]],
+        targets: list[tuple[float, float]],
+    ) -> _FittedMapping:
+        requested_type = str(self.config.mapping_model_type).lower()
+        if requested_type != "auto":
+            model = create_mapping_model(requested_type)
+            model.fit(raw, targets)
+            return _FittedMapping(model_type=model.model_type.value, parameters=model.to_parameters())
+
+        candidates = ("grid", "idw", "polynomial", "linear", "affine")
+        best_score: float | None = None
+        best_model_type: str | None = None
+        best_parameters: dict[str, object] | None = None
+        for candidate in candidates:
+            model = create_mapping_model(candidate)
+            try:
+                model.fit(raw, targets)
+            except (ValueError, RuntimeError):
+                continue
+            score = self._mapping_score(model)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_model_type = model.model_type.value
+                best_parameters = model.to_parameters()
+
+        if best_model_type is None or best_parameters is None:
+            raise RuntimeError("auto mapping could not fit any candidate model")
+        return _FittedMapping(model_type=best_model_type, parameters=best_parameters)
+
+    def _mapping_score(self, model: object) -> float:
+        raw_means, targets = calibration_point_means(self.samples)
+        if not raw_means:
+            return float("inf")
+        point_score = self._mean_prediction_error_score(model, raw_means, targets)
+        sample_raw = [sample.raw_gaze for sample in self.samples]
+        sample_targets = [(float(sample.target_screen[0]), float(sample.target_screen[1])) for sample in self.samples]
+        sample_score = self._mean_prediction_error_score(model, sample_raw, sample_targets)
+        sample_clipped_ratio = self._prediction_clipped_ratio(model, sample_raw)
+        return max(point_score, sample_score) + (sample_clipped_ratio * 4.0)
+
+    def _mean_prediction_error_score(
+        self,
+        model: object,
+        raw_values: list[tuple[float, float]],
+        targets: list[tuple[float, float]],
+    ) -> float:
+        if not raw_values:
+            return float("inf")
+        total = 0.0
+        for raw, target in zip(raw_values, targets):
+            prediction = model.predict(raw)  # type: ignore[attr-defined]
+            total += abs(prediction.x - target[0]) / max(1, self.screen_width)
+            total += abs(prediction.y - target[1]) / max(1, self.screen_height)
+        return total / len(raw_values)
+
+    def _prediction_clipped_ratio(
+        self,
+        model: object,
+        raw_values: list[tuple[float, float]],
+    ) -> float:
+        if not raw_values:
+            return 1.0
+        clipped_count = 0
+        for raw in raw_values:
+            prediction = model.predict(raw)  # type: ignore[attr-defined]
+            if (
+                prediction.x < 0
+                or prediction.x > self.screen_width - 1
+                or prediction.y < 0
+                or prediction.y > self.screen_height - 1
+            ):
+                clipped_count += 1
+        return clipped_count / len(raw_values)
 
 
 def _mean_or_none(values: list[float]) -> float | None:
